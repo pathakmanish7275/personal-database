@@ -25,12 +25,17 @@ def _get():
     try:
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-        _tok = AutoTokenizer.from_pretrained(config.rebel_model)
-        _model = AutoModelForSeq2SeqLM.from_pretrained(config.rebel_model)
+        # Try cached-only first so offline runs don't make network calls.
+        try:
+            _tok = AutoTokenizer.from_pretrained(config.rebel_model, local_files_only=True)
+            _model = AutoModelForSeq2SeqLM.from_pretrained(config.rebel_model, local_files_only=True)
+        except Exception:  # noqa: BLE001
+            _tok = AutoTokenizer.from_pretrained(config.rebel_model)
+            _model = AutoModelForSeq2SeqLM.from_pretrained(config.rebel_model)
         _model.eval()
         log.info("loaded REBEL %s", config.rebel_model)
-    except Exception:  # noqa: BLE001
-        log.exception("REBEL unavailable; relation extraction disabled")
+    except Exception as e:  # noqa: BLE001
+        log.warning("REBEL unavailable; relation extraction disabled (%s)", e)
         _failed = True
     return _tok, _model
 

@@ -40,10 +40,14 @@ def _get_model():
     try:
         from gliner import GLiNER
 
-        _model = GLiNER.from_pretrained(config.gliner_model)
+        # Try cached-only first so offline runs don't make network calls.
+        try:
+            _model = GLiNER.from_pretrained(config.gliner_model, local_files_only=True)
+        except Exception:  # noqa: BLE001
+            _model = GLiNER.from_pretrained(config.gliner_model)
         log.info("loaded GLiNER %s", config.gliner_model)
-    except Exception:  # noqa: BLE001
-        log.exception("GLiNER unavailable; entity extraction disabled")
+    except Exception as e:  # noqa: BLE001
+        log.warning("GLiNER unavailable; entity extraction disabled (%s)", e)
         _failed = True
     return _model
 
