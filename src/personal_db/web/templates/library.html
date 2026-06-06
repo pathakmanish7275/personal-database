@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Library — Personal Database{% endblock %}
+{% block content %}
+<h1>Library</h1>
+<p class="meta">{{ docs | length }} document(s), {{ total_chunks }} chunk(s) total.</p>
+
+{% if docs %}
+<table class="library">
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Type</th>
+      <th>Chars</th>
+      <th>Chunks</th>
+      <th>Ingested</th>
+      <th>Path</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for d in docs %}
+    <tr>
+      <td>{{ d.name }}</td>
+      <td>{{ d.source }}</td>
+      <td>{{ d.chars or '?' }}</td>
+      <td>{{ d.chunks }}</td>
+      <td>{{ (d.ingested_at or '')[:16].replace('T', ' ') }}</td>
+      <td class="cite-path">{{ d.path }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>Nothing ingested yet. Head to <a href="/ingest">Ingest</a>.</p>
+{% endif %}
+{% endblock %}

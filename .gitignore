@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local config (contains API keys, DO NOT commit)
+.env
+
+# Local data (vector + graph stores, raw uploads, session DB)
+data/

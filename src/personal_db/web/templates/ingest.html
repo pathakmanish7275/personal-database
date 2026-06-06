@@ -1,0 +1,197 @@
+{% extends "base.html" %}
+{% block title %}Ingest — Personal Database{% endblock %}
+{% block content %}
+<h1>Ingest</h1>
+<p class="meta">Supported: <code>.md</code> <code>.markdown</code> <code>.txt</code> <code>.pdf</code></p>
+
+<form id="ingestForm" class="ingest-form" hx-boost="false" enctype="multipart/form-data">
+  <fieldset>
+    <legend>By file upload</legend>
+    <input type="file" name="files" multiple accept=".md,.markdown,.txt,.pdf">
+    <p class="hint">Uploaded files are copied to <code>./data/raw</code>.</p>
+  </fieldset>
+
+  <fieldset>
+    <legend>By local path</legend>
+    <input type="text" name="path" placeholder="/home/you/Documents/notes  (file or directory)" style="width:100%;">
+    <p class="hint">A directory will be recursively scanned for supported files.</p>
+  </fieldset>
+
+  <button type="submit" id="ingestBtn">Ingest</button>
+  <p id="ingestFormError" class="err" hidden></p>
+</form>
+
+<section id="ingestProgress" class="ingest-progress" hidden>
+  <div class="progress-head">
+    <span id="progLabel" class="progress-label">Starting…</span>
+    <span id="progCount" class="progress-count"></span>
+  </div>
+  <div class="progress-track"><div id="progFill" class="progress-fill"></div></div>
+  <p class="hint" id="progNote">Ingestion keeps running even if you leave this page.</p>
+  <ul id="progLog" class="progress-log"></ul>
+  <div id="progDone" class="progress-done" hidden>
+    <a href="/library">View library →</a>
+    <button type="button" id="ingestMoreBtn">Ingest more</button>
+  </div>
+</section>
+
+<script>
+(function () {
+  const form    = document.getElementById('ingestForm');
+  const btn     = document.getElementById('ingestBtn');
+  const formErr = document.getElementById('ingestFormError');
+  const panel   = document.getElementById('ingestProgress');
+  const label   = document.getElementById('progLabel');
+  const count   = document.getElementById('progCount');
+  const fill    = document.getElementById('progFill');
+  const log     = document.getElementById('progLog');
+  const donePane = document.getElementById('progDone');
+  const moreBtn = document.getElementById('ingestMoreBtn');
+
+  function showError(msg) {
+    formErr.textContent = msg;
+    formErr.hidden = false;
+    btn.disabled = false;
+  }
+
+  function resetView() {
+    panel.hidden = true;
+    donePane.hidden = true;
+    log.innerHTML = '';
+    fill.style.width = '0%';
+    fill.classList.remove('error', 'complete');
+    formErr.hidden = true;
+    btn.disabled = false;
+    form.reset();
+  }
+
+  function startStream() {
+    // Close any prior stream the shell is tracking, then open ours.
+    if (window.__pdb && window.__pdb.activeES) {
+      try { window.__pdb.activeES.close(); } catch (_) {}
+    }
+    const es = new EventSource('/ingest/stream');
+    window.__pdb = window.__pdb || {};
+    window.__pdb.activeES = es;
+
+    es.addEventListener('start', (e) => {
+      const d = JSON.parse(e.data || '{}');
+      label.textContent = 'Ingesting…';
+      count.textContent = '0 / ' + (d.total || 0);
+      fill.style.width = '0%';
+    });
+
+    es.addEventListener('progress', (e) => {
+      const d = JSON.parse(e.data || '{}');
+      const total = d.total || 1;
+      const done = d.done || 0;
+      const pct = Math.round((done / total) * 100);
+      fill.style.width = pct + '%';
+      count.textContent = done + ' / ' + total;
+
+      if (d.status === 'processing') {
+        label.textContent = 'Processing: ' + d.name;
+      } else {
+        // A file just finished — append a result line.
+        const li = document.createElement('li');
+        let badge = d.status;
+        if (d.status === 'ingested') {
+          const extras = [];
+          if (d.chunks != null)   extras.push(d.chunks + ' chunks');
+          if (d.entities != null) extras.push(d.entities + ' entities');
+          badge = '✓ ' + d.name + (extras.length ? ' (' + extras.join(', ') + ')' : '');
+          li.className = 'ok';
+        } else if (d.status === 'graph_only') {
+          badge = '✓ ' + d.name + ' — graph populated (' + (d.entities || 0) + ' entities, no re-embed)';
+          li.className = 'ok';
+        } else if (d.status === 'skipped') {
+          badge = '↩ ' + d.name + ' — already in your database';
+          li.className = 'skip';
+        } else if (d.status === 'empty') {
+          badge = '∅ ' + d.name + ' — empty, skipped';
+          li.className = 'skip';
+        } else {
+          badge = '✗ ' + d.name + (d.error ? ' — ' + d.error : ' — failed');
+          li.className = 'fail';
+        }
+        li.textContent = badge;
+        log.appendChild(li);
+        log.scrollTop = log.scrollHeight;
+      }
+    });
+
+    es.addEventListener('done', (e) => {
+      const d = JSON.parse(e.data || '{}');
+      fill.style.width = '100%';
+      fill.classList.add('complete');
+      label.textContent = 'Done';
+      const parts = [];
+      if (d.ingested != null) parts.push(d.ingested + ' ingested');
+      if (d.skipped)          parts.push(d.skipped + ' skipped');
+      if (d.failed)           parts.push(d.failed + ' failed');
+      count.textContent = parts.join(' · ') || 'complete';
+      donePane.hidden = false;
+      es.close();
+      if (window.__pdb) window.__pdb.activeES = null;
+    });
+
+    es.addEventListener('error', (e) => {
+      // Distinguish a server-sent error event (has data) from a transport drop.
+      if (e.data) {
+        let msg = e.data;
+        try { msg = JSON.parse(e.data); } catch (_) {}
+        label.textContent = 'Failed';
+        fill.classList.add('error');
+        const li = document.createElement('li');
+        li.className = 'fail';
+        li.textContent = '✗ ' + msg;
+        log.appendChild(li);
+        donePane.hidden = false;
+      }
+      // On a transport error with no data the browser auto-reconnects; if the
+      // job is gone the next connect 404s and we just stop.
+    });
+  }
+
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    formErr.hidden = true;
+    btn.disabled = true;
+
+    const fd = new FormData(form);
+    const hasFiles = fd.getAll('files').some((f) => f && f.name);
+    const hasPath = (fd.get('path') || '').trim().length > 0;
+    if (!hasFiles && !hasPath) {
+      showError('Choose at least one file or enter a path.');
+      return;
+    }
+
+    let resp;
+    try {
+      resp = await fetch('/ingest/start', { method: 'POST', body: fd });
+    } catch (err) {
+      showError('Network error starting ingestion.');
+      return;
+    }
+    if (!resp.ok) {
+      let detail = 'Could not start ingestion.';
+      try { detail = (await resp.json()).detail || detail; } catch (_) {}
+      showError(detail);
+      return;
+    }
+    panel.hidden = false;
+    donePane.hidden = true;
+    log.innerHTML = '';
+    startStream();
+  });
+
+  moreBtn.addEventListener('click', resetView);
+
+  // Resume view if an ingestion is already running (e.g. user navigated back).
+  {% if active %}
+  panel.hidden = false;
+  startStream();
+  {% endif %}
+})();
+</script>
+{% endblock %}
