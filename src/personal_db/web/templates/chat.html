@@ -1,0 +1,343 @@
+{% extends "base.html" %}
+{% block title %}Chat — Personal Database{% endblock %}
+{% block content %}
+<div class="chat-layout">
+  <aside class="sidebar">
+    <form id="newSessionForm" method="post" action="/chat/new" style="margin-bottom:0.75rem;">
+      <button type="submit">+ New session</button>
+    </form>
+    <ul class="session-list">
+      {% for s in sessions %}
+      <li class="session-item{% if current and s.id == current.id %} active{% endif %}">
+        {# Stretched link covers the whole li — title and meta sit on top of it. #}
+        <a href="/chat/{{ s.id }}" class="session-link" aria-label="Open {{ s.title }}"></a>
+        <span class="session-title">{{ s.title }}</span>
+        <span class="meta">{{ s.updated_at[:16].replace('T', ' ') }}</span>
+        <form method="post" action="/chat/{{ s.id }}/delete" class="inline-form"
+              onsubmit="return confirm('Delete this session?')">
+          <button type="submit" class="link-btn" title="Delete">×</button>
+        </form>
+      </li>
+      {% else %}
+      <li class="empty">No sessions yet.</li>
+      {% endfor %}
+    </ul>
+  </aside>
+
+  <section class="chat-pane">
+    {% if not current %}
+      <div class="empty-state">
+        <h1 class="empty-title">Personal Database</h1>
+        <p class="empty-sub">A local assistant grounded in your own notes, journals, drafts, and PDFs.</p>
+
+        <div class="empty-stats">
+          <div class="stat">
+            <span class="stat-value">{{ (stats.docs if stats else 0) }}</span>
+            <span class="stat-label">document{{ '' if (stats and stats.docs == 1) else 's' }}</span>
+          </div>
+          <div class="stat">
+            <span class="stat-value">{{ (stats.chunks if stats else 0) }}</span>
+            <span class="stat-label">chunk{{ '' if (stats and stats.chunks == 1) else 's' }} indexed</span>
+          </div>
+          <div class="stat">
+            <span class="stat-value">{{ (stats.sessions if stats else (sessions | length)) }}</span>
+            <span class="stat-label">past session{{ '' if (stats and stats.sessions == 1) else 's' }}</span>
+          </div>
+        </div>
+
+        <div class="empty-actions">
+          <form method="post" action="/chat/new" style="display:inline;">
+            <button type="submit" class="primary">+ Start a new chat</button>
+          </form>
+          <a class="ghost-link" href="/library">Browse library →</a>
+          <a class="ghost-link" href="/ingest">Ingest something →</a>
+        </div>
+
+        <hr class="empty-divider">
+
+        <ul class="empty-notes">
+          <li><span class="kbd">Enter</span> sends · <span class="kbd">Shift</span>+<span class="kbd">Enter</span> for a new line.</li>
+          <li>Each session keeps a running compact summary so the model remembers the gist of older turns without burning context.</li>
+          <li>Only one generation runs at a time. Send across sessions freely — they queue automatically.</li>
+        </ul>
+      </div>
+    {% else %}
+      <h2 class="chat-title">{{ current.title }}</h2>
+      {% if summary %}
+      <details class="memory-panel" id="memoryPanel">
+        <summary>Session memory · {{ summary|length }} chars · up to msg #{{ summary_up_to_msg_id }}</summary>
+        <pre id="memoryText">{{ summary }}</pre>
+      </details>
+      {% else %}
+      <details class="memory-panel" id="memoryPanel" style="display:none">
+        <summary>Session memory</summary>
+        <pre id="memoryText"></pre>
+      </details>
+      {% endif %}
+      <div id="messages"
+           class="messages"
+           data-session-id="{{ current.id }}"
+           data-active-job="{{ 'true' if active_job else 'false' }}">
+        {% for m in messages %}
+          <div class="msg msg-{{ m.role }}">
+            <div class="content">{{ m.content }}</div>
+            {% if m.citations %}
+              <div class="cite-strip">
+                {% for c in m.citations %}
+                  {% set o = c.origin or 'semantic' %}
+                  <span class="cite-chip origin-{{ o }}" title="{{ c.path }}" data-n="{{ c.n }}">{% if o == 'graph' %}<span class="cite-origin kg">kg</span>{% elif o == 'both' %}<span class="cite-origin both">kg+</span>{% endif %}{{ c.n }}. {{ c.name }}</span>
+                {% endfor %}
+              </div>
+            {% endif %}
+          </div>
+        {% endfor %}
+      </div>
+
+      <form id="askForm" class="ask-form">
+        <textarea id="q" name="q" rows="3" placeholder="Ask anything from your database…  (Enter to send · Shift+Enter for new line)" required></textarea>
+        <button type="submit">Send</button>
+      </form>
+
+      <script>
+        (function () {
+          const SID = "{{ current.id }}";
+          const form     = document.getElementById('askForm');
+          const messages = document.getElementById('messages');
+          const ta       = document.getElementById('q');
+
+          // ─── shared helpers ───────────────────────────────────────────
+          function escapeHTML(s) {
+            return s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+          }
+          // Turn [1], [12], 【1】 into small superscript chips.
+          function renderCites(text) {
+            return escapeHTML(text).replace(
+              /[\[【](\d{1,3})[\]】]/g,
+              '<sup class="cite-ref" data-n="$1">$1</sup>'
+            );
+          }
+
+          // Render server-stored assistant messages with citation superscripts.
+          document.querySelectorAll('.msg-assistant .content').forEach(el => {
+            el.innerHTML = renderCites(el.textContent);
+          });
+
+          // ─── ES tracking — one global slot so any navigation can close it ─
+          window.__pdb = window.__pdb || { activeES: null };
+          if (window.__pdb.activeES) {
+            try { window.__pdb.activeES.close(); } catch (_) {}
+            window.__pdb.activeES = null;
+          }
+          function setActiveES(es) { window.__pdb.activeES = es; }
+          function clearActiveES() { window.__pdb.activeES = null; }
+
+          // ─── building blocks ──────────────────────────────────────────
+          function buildAssistantBubble() {
+            const aDiv = document.createElement('div');
+            aDiv.className = 'msg msg-assistant streaming fresh';
+            const aStatus = document.createElement('div');
+            aStatus.className = 'status thinking';
+            aStatus.textContent = 'preparing';
+            const aContent = document.createElement('div');
+            aContent.className = 'content';
+            const aCiteStrip = document.createElement('div');
+            aCiteStrip.className = 'cite-strip';
+            aCiteStrip.style.display = 'none';
+            aDiv.appendChild(aStatus);
+            aDiv.appendChild(aContent);
+            aDiv.appendChild(aCiteStrip);
+            return { aDiv, aStatus, aContent, aCiteStrip };
+          }
+
+          function attachStreamHandlers(es, { aDiv, aStatus, aContent, aCiteStrip }) {
+            let streamedText = '';
+
+            es.addEventListener('status', function (e) {
+              const info = JSON.parse(e.data || '{}');
+              if (aStatus && aStatus.parentNode && info.text) {
+                aStatus.textContent = info.text;
+                aStatus.dataset.phase = info.phase || '';
+              }
+            });
+
+            es.addEventListener('memory', function (e) {
+              const info = JSON.parse(e.data || '{}');
+              const banner = document.createElement('div');
+              banner.className = 'memory-notice';
+              banner.textContent = `memory compacted · folded ${info.compressed_count} turns · summary ${info.summary_chars} chars`;
+              messages.insertBefore(banner, aDiv);
+              messages.scrollTop = messages.scrollHeight;
+            });
+
+            es.addEventListener('clarify', function (e) {
+              const info = JSON.parse(e.data || '{}');
+              aDiv.classList.add('msg-clarify');
+              const tag = document.createElement('div');
+              tag.className = 'clarify-tag';
+              tag.textContent = 'Clarification needed';
+              if (info.reason) tag.title = info.reason;
+              aDiv.insertBefore(tag, aContent);
+            });
+
+            es.addEventListener('graph', function (e) {
+              const info = JSON.parse(e.data || '{}');
+              const banner = document.createElement('div');
+              banner.className = 'graph-notice';
+              const parts = [];
+              const ents = (info.entities || []).slice(0, 8);
+              if (ents.length) {
+                const links = ents.map(name =>
+                  `<a href="/graph?e=${encodeURIComponent(name)}">${escapeHTML(name)}</a>`
+                ).join(', ');
+                parts.push(`matched ${links}`);
+              }
+              if (info.chunks)    parts.push(`${info.chunks} graph chunk${info.chunks === 1 ? '' : 's'}`);
+              if (info.relations) parts.push(`${info.relations} relation${info.relations === 1 ? '' : 's'}`);
+              if (parts.length === 0) parts.push('no entities recognized — vector-only this turn');
+              banner.innerHTML = '<span class="gn-tag">graph</span> ' + parts.join(' · ');
+              messages.insertBefore(banner, aDiv);
+              messages.scrollTop = messages.scrollHeight;
+            });
+
+            es.addEventListener('citations', function (e) {
+              const cites = JSON.parse(e.data || '[]');
+              if (!cites || !cites.length) return;
+              aCiteStrip.style.display = '';
+              aCiteStrip.innerHTML = '';
+              cites.forEach(c => {
+                const chip = document.createElement('span');
+                const origin = c.origin || 'semantic';
+                chip.className = 'cite-chip origin-' + origin;
+                chip.dataset.n = c.n;
+                chip.title = (c.path || '') +
+                  (origin !== 'semantic' ? ` · source: ${origin}` : '');
+                let badge = '';
+                if (origin === 'graph')      badge = '<span class="cite-origin kg">kg</span>';
+                else if (origin === 'both')  badge = '<span class="cite-origin both">kg+</span>';
+                chip.innerHTML = `${badge}${c.n}. ${escapeHTML(c.name)}`;
+                aCiteStrip.appendChild(chip);
+              });
+            });
+
+            es.addEventListener('token', function (e) {
+              const delta = JSON.parse(e.data || '""');
+              if (aStatus && aStatus.parentNode) {
+                aStatus.parentNode.removeChild(aStatus);
+              }
+              streamedText += delta;
+              aContent.textContent = streamedText;
+              messages.scrollTop = messages.scrollHeight;
+            });
+
+            function finish() {
+              aDiv.classList.remove('streaming');
+              if (aStatus && aStatus.parentNode) {
+                aStatus.parentNode.removeChild(aStatus);
+              }
+              if (streamedText) {
+                aContent.innerHTML = renderCites(streamedText);
+              } else if (!aContent.textContent) {
+                aContent.textContent = '(no response saved — generation may have been cancelled)';
+                aContent.classList.add('err');
+              } else {
+                aContent.innerHTML = renderCites(aContent.textContent);
+              }
+              try { es.close(); } catch (_) {}
+              clearActiveES();
+              ta.disabled = false;
+              ta.focus();
+            }
+
+            es.addEventListener('done',  finish);
+            es.addEventListener('error', finish);
+            return finish;
+          }
+
+          function openStream(bubble) {
+            const es = new EventSource(`/chat/${SID}/stream`);
+            setActiveES(es);
+            attachStreamHandlers(es, bubble);
+            return es;
+          }
+
+          // ─── auto-resume if the server says a job is in flight ────────
+          if (messages.dataset.activeJob === 'true') {
+            const bubble = buildAssistantBubble();
+            messages.appendChild(bubble.aDiv);
+            ta.disabled = true;
+            messages.scrollTop = messages.scrollHeight;
+            openStream(bubble);
+          }
+
+          // ─── submit a new question ────────────────────────────────────
+          form.addEventListener('submit', async function (e) {
+            e.preventDefault();
+            const q = ta.value.trim();
+            if (!q) return;
+
+            // Close any previous stream so the connection slot is freed.
+            if (window.__pdb.activeES) {
+              try { window.__pdb.activeES.close(); } catch (_) {}
+              window.__pdb.activeES = null;
+            }
+
+            const userDiv = document.createElement('div');
+            userDiv.className = 'msg msg-user fresh';
+            const userContent = document.createElement('div');
+            userContent.className = 'content';
+            userContent.textContent = q;
+            userDiv.appendChild(userContent);
+            messages.appendChild(userDiv);
+
+            const bubble = buildAssistantBubble();
+            messages.appendChild(bubble.aDiv);
+
+            ta.value = '';
+            ta.disabled = true;
+            messages.scrollTop = messages.scrollHeight;
+
+            // Start the background job, then subscribe to its event stream.
+            try {
+              const r = await fetch(`/chat/${SID}/ask`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ q })
+              });
+              if (!r.ok) {
+                const text = await r.text();
+                bubble.aContent.textContent = `(error starting generation: ${r.status} ${text})`;
+                bubble.aContent.classList.add('err');
+                if (bubble.aStatus && bubble.aStatus.parentNode) {
+                  bubble.aStatus.parentNode.removeChild(bubble.aStatus);
+                }
+                ta.disabled = false;
+                ta.focus();
+                return;
+              }
+            } catch (err) {
+              bubble.aContent.textContent = `(network error: ${err.message})`;
+              bubble.aContent.classList.add('err');
+              if (bubble.aStatus && bubble.aStatus.parentNode) {
+                bubble.aStatus.parentNode.removeChild(bubble.aStatus);
+              }
+              ta.disabled = false;
+              return;
+            }
+            openStream(bubble);
+          });
+
+          // ─── input keys ───────────────────────────────────────────────
+          ta.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+              e.preventDefault();
+              form.requestSubmit();
+            }
+          });
+
+          messages.scrollTop = messages.scrollHeight;
+        })();
+      </script>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

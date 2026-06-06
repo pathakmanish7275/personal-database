@@ -1,0 +1,65 @@
+[project]
+name = "personal-db"
+version = "0.1.0"
+description = "Local RAG + KG assistant grounded in your own corpus"
+authors = [
+    { name = "Manish Pathak", email = "pathakmanish7275@gmail.com" }
+]
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "llama-index-core>=0.12.0",
+    "llama-index-llms-ollama>=0.5.0",
+    "llama-index-embeddings-ollama>=0.5.0",
+    "llama-index-vector-stores-qdrant>=0.5.0",
+    "llama-index-graph-stores-kuzu>=0.7.0",
+    "qdrant-client>=1.12.0",
+    "kuzu>=0.7.0",
+    "ollama>=0.4.0",
+    "pymupdf4llm>=0.0.17",
+    "typer>=0.15.0",
+    "rich>=13.9.0",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.9.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "jinja2>=3.1.0",
+    "python-multipart>=0.0.12",
+    "sse-starlette>=2.1.0",
+    # Non-LLM knowledge-graph extraction (CPU). torch is pinned to the CPU
+    # wheel index below so we don't pull multi-GB CUDA builds on this NVIDIA-less box.
+    "torch>=2.2.0",
+    "gliner>=0.2.13",
+    "transformers>=4.40.0",
+    "llama-index-llms-google-genai>=0.9.5",
+    # Optional cloud providers — install whichever you need.
+    "llama-index-llms-openai>=0.4.0",
+    "llama-index-llms-anthropic>=0.6.0",
+]
+
+[project.scripts]
+pdb = "personal_db.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.11.16,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "personal_db"
+module-root = "src"
+
+# Pull torch from the CPU-only wheel index (no CUDA).
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = [
+  "ignore::DeprecationWarning",
+  "ignore::PendingDeprecationWarning",
+]

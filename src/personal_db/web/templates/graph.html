@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+{% block title %}Graph — Personal Database{% endblock %}
+{% block content %}
+<h1>Knowledge graph</h1>
+
+<div class="graph-stats">
+  <div class="stat"><span class="stat-value">{{ counts.documents }}</span><span class="stat-label">docs</span></div>
+  <div class="stat"><span class="stat-value">{{ counts.entities }}</span><span class="stat-label">entities</span></div>
+  <div class="stat"><span class="stat-value">{{ counts.relations }}</span><span class="stat-label">relations</span></div>
+  <div class="stat"><span class="stat-value">{{ counts.mentions }}</span><span class="stat-label">mentions</span></div>
+  <div class="stat"><span class="stat-value">{{ counts.chunks }}</span><span class="stat-label">chunks</span></div>
+</div>
+
+{% if backfill_pending > 0 or active %}
+<section class="graph-backfill">
+  <p class="hint">
+    {{ backfill_pending }} document(s) in your corpus aren't in the graph yet.
+    Building extracts entities &amp; relations with GLiNER + REBEL (CPU — can take a while).
+  </p>
+  <button type="button" id="buildBtn">Build graph from corpus</button>
+  <p id="buildErr" class="err" hidden></p>
+  <section id="buildProgress" class="ingest-progress" hidden>
+    <div class="progress-head">
+      <span id="bLabel" class="progress-label">Starting…</span>
+      <span id="bCount" class="progress-count"></span>
+    </div>
+    <div class="progress-track"><div id="bFill" class="progress-fill"></div></div>
+    <ul id="bLog" class="progress-log"></ul>
+  </section>
+</section>
+{% endif %}
+
+<form method="get" action="/graph" class="graph-search" hx-boost="false">
+  <input type="text" name="q" value="{{ query or '' }}" placeholder="search entities…" autocomplete="off">
+  <button type="submit">Search</button>
+</form>
+
+{% if detail %}
+<section class="entity-detail">
+  <h2>{{ detail.name }} <span class="entity-type">{{ detail.type }}</span></h2>
+  <p class="meta">{{ detail.mentions }} mention(s){% if detail.documents %} · in {{ detail.documents|length }} doc(s){% endif %}</p>
+
+  {% if detail.out_relations or detail.in_relations %}
+  <div class="rel-cols">
+    {% if detail.out_relations %}
+    <div>
+      <h3>Outgoing</h3>
+      <ul class="rel-list">
+        {% for r in detail.out_relations %}
+        <li><span class="rel-pred">{{ r.predicate }}</span> → <a href="/graph?e={{ r.target | urlencode }}">{{ r.target }}</a></li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+    {% if detail.in_relations %}
+    <div>
+      <h3>Incoming</h3>
+      <ul class="rel-list">
+        {% for r in detail.in_relations %}
+        <li><a href="/graph?e={{ r.source | urlencode }}">{{ r.source }}</a> <span class="rel-pred">{{ r.predicate }}</span> →</li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+  </div>
+  {% else %}
+  <p class="hint">No relations recorded for this entity yet — it appears as a mention only.</p>
+  {% endif %}
+
+  {% if detail.documents %}
+  <h3>Appears in</h3>
+  <ul class="rel-list">
+    {% for d in detail.documents %}<li>{{ d.name }}</li>{% endfor %}
+  </ul>
+  {% endif %}
+  <p><a href="/graph" class="ghost-link">← all entities</a></p>
+</section>
+{% endif %}
+
+<h2>{% if query %}Matches for "{{ query }}"{% else %}Top entities{% endif %}</h2>
+{% if entities %}
+<div class="entity-chips">
+  {% for ent in entities %}
+  <a class="entity-chip" href="/graph?e={{ ent.name | urlencode }}">
+    <span class="ec-type">{{ ent.type }}</span>{{ ent.name }}<span class="ec-count">{{ ent.mentions }}</span>
+  </a>
+  {% endfor %}
+</div>
+{% else %}
+<p class="hint">
+  {% if counts.entities == 0 %}
+    The graph is empty. {% if backfill_pending > 0 %}Build it from your corpus above,{% else %}Ingest some documents,{% endif %} then come back.
+  {% else %}
+    No entities match that search.
+  {% endif %}
+</p>
+{% endif %}
+
+<script>
+(function () {
+  const buildBtn = document.getElementById('buildBtn');
+  if (!buildBtn) return;
+  const err   = document.getElementById('buildErr');
+  const panel = document.getElementById('buildProgress');
+  const label = document.getElementById('bLabel');
+  const count = document.getElementById('bCount');
+  const fill  = document.getElementById('bFill');
+  const log   = document.getElementById('bLog');
+
+  function stream() {
+    if (window.__pdb && window.__pdb.activeES) { try { window.__pdb.activeES.close(); } catch (_) {} }
+    const es = new EventSource('/ingest/stream');
+    window.__pdb = window.__pdb || {}; window.__pdb.activeES = es;
+
+    es.addEventListener('start', (e) => {
+      const d = JSON.parse(e.data || '{}');
+      label.textContent = 'Extracting…'; count.textContent = '0 / ' + (d.total || 0);
+    });
+    es.addEventListener('progress', (e) => {
+      const d = JSON.parse(e.data || '{}');
+      const total = d.total || 1, done = d.done || 0;
+      fill.style.width = Math.round((done / total) * 100) + '%';
+      count.textContent = done + ' / ' + total;
+      if (d.status === 'processing') { label.textContent = 'Processing: ' + d.name; return; }
+      const li = document.createElement('li');
+      if (d.status === 'ingested') {
+        li.className = 'ok';
+        li.textContent = '✓ ' + d.name + ' (' + (d.entities || 0) + ' entities, ' + (d.relations || 0) + ' relations)';
+      } else { li.className = 'fail'; li.textContent = '✗ ' + d.name + (d.error ? ' — ' + d.error : ''); }
+      log.appendChild(li); log.scrollTop = log.scrollHeight;
+    });
+    es.addEventListener('done', () => {
+      fill.style.width = '100%'; fill.classList.add('complete'); label.textContent = 'Done — reloading…';
+      es.close(); if (window.__pdb) window.__pdb.activeES = null;
+      setTimeout(() => window.location.assign('/graph'), 900);
+    });
+    es.addEventListener('error', (e) => {
+      if (e.data) { label.textContent = 'Failed'; fill.classList.add('error'); }
+    });
+  }
+
+  buildBtn.addEventListener('click', async () => {
+    err.hidden = true; buildBtn.disabled = true;
+    let resp;
+    try { resp = await fetch('/graph/build', { method: 'POST' }); }
+    catch (_) { err.textContent = 'Network error.'; err.hidden = false; buildBtn.disabled = false; return; }
+    if (!resp.ok) {
+      let m = 'Could not start build.';
+      try { m = (await resp.json()).detail || m; } catch (_) {}
+      err.textContent = m; err.hidden = false; buildBtn.disabled = false; return;
+    }
+    panel.hidden = false; log.innerHTML = ''; stream();
+  });
+
+  {% if active %}
+  panel.hidden = false; buildBtn.disabled = true; stream();
+  {% endif %}
+})();
+</script>
+{% endblock %}

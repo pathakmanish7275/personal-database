@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Personal Database{% endblock %}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/static/style.css">
+<script src="https://unpkg.com/htmx.org@2.0.3"></script>
+<script>
+  // Track the live EventSource so we can close it on any navigation —
+  // hx-boost swap, regular link click, tab close, etc. Without this, open
+  // SSE connections leak; browsers cap concurrent connections per origin
+  // and the UI starts to freeze after a few navigations mid-stream.
+  window.__pdb = window.__pdb || { activeES: null };
+  function pdbCloseStream(reason) {
+    const es = window.__pdb.activeES;
+    if (es) {
+      try { es.close(); } catch (_) {}
+      window.__pdb.activeES = null;
+    }
+  }
+  document.addEventListener('htmx:beforeSwap', () => pdbCloseStream('hx-swap'));
+  window.addEventListener('beforeunload',     () => pdbCloseStream('unload'));
+  window.addEventListener('pagehide',         () => pdbCloseStream('pagehide'));
+</script>
+</head>
+<body hx-boost="true">
+<nav>
+  <strong>Personal Database</strong>
+  <a href="/chat">Chat</a>
+  <a href="/library">Library</a>
+  <a href="/graph">Graph</a>
+  <a href="/ingest">Ingest</a>
+</nav>
+<main>
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>

@@ -1,0 +1,414 @@
+"""FastAPI web UI.
+
+Architecture:
+
+  POST /chat/{sid}/ask       — starts a background generation task. Returns 200
+                                with the job snapshot. The task survives any
+                                client disconnect.
+  GET  /chat/{sid}/stream    — subscribes to the active job's events via SSE.
+                                Replays any past events so reconnecting clients
+                                see what they missed.
+  POST /chat/{sid}/cancel    — cancels the active job for this session.
+  POST /chat/{sid}/delete    — cancels + deletes the session.
+
+All endpoints are async so SSE streams don't tie up the request thread pool.
+The heavy LLM / DB work happens in asyncio.to_thread inside the background task.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import shutil
+from pathlib import Path
+
+from fastapi import FastAPI, Form, HTTPException, Request, UploadFile, File
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
+from sse_starlette.sse import EventSourceResponse
+
+from .. import chat as chat_engine
+from .. import ingest_jobs
+from .. import jobs as jobs_mod
+from .. import sessions as sess_store
+from ..config import config
+from ..ingest import (
+    SUPPORTED_SUFFIXES,
+    existing_doc_ids,
+    extract_file_to_graph,
+    graph_backfill_targets,
+    ingest_one,
+    iter_files,
+    list_documents,
+)
+from ..stores import init_stores
+
+WEB_DIR = Path(__file__).parent
+templates = Jinja2Templates(directory=str(WEB_DIR / "templates"))
+
+app = FastAPI(title="Personal Database", docs_url=None, redoc_url=None)
+app.mount("/static", StaticFiles(directory=str(WEB_DIR / "static")), name="static")
+
+_stores = None
+
+
+def get_stores():
+    global _stores
+    if _stores is None:
+        _stores = init_stores()
+    return _stores
+
+
+# ─── pages ──────────────────────────────────────────────────────────────────
+
+
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    return RedirectResponse(url="/chat")
+
+
+@app.get("/chat", response_class=HTMLResponse)
+async def chat_index(request: Request):
+    sessions, docs = await asyncio.gather(
+        asyncio.to_thread(sess_store.list_sessions),
+        asyncio.to_thread(list_documents, get_stores()),
+    )
+    stats = {
+        "sessions": len(sessions),
+        "docs": len(docs),
+        "chunks": sum(d.get("chunks", 0) for d in docs),
+    }
+    return templates.TemplateResponse(
+        request,
+        "chat.html",
+        {
+            "sessions": sessions,
+            "current": None,
+            "messages": [],
+            "active_job": False,
+            "stats": stats,
+        },
+    )
+
+
+@app.post("/chat/new")
+async def chat_new():
+    s = await asyncio.to_thread(sess_store.create_session)
+    return RedirectResponse(url=f"/chat/{s.id}", status_code=303)
+
+
+@app.get("/chat/{sid}", response_class=HTMLResponse)
+async def chat_view(request: Request, sid: str):
+    session = await asyncio.to_thread(sess_store.get_session, sid)
+    if not session:
+        raise HTTPException(404, "session not found")
+    sessions, messages = await asyncio.gather(
+        asyncio.to_thread(sess_store.list_sessions),
+        asyncio.to_thread(sess_store.get_messages, sid),
+    )
+    msgs = []
+    for m in messages:
+        cites = []
+        if m.citations:
+            try:
+                cites = json.loads(m.citations)
+            except Exception:
+                cites = []
+        msgs.append({"role": m.role, "content": m.content, "citations": cites})
+
+    active = jobs_mod.get_active(sid)
+    return templates.TemplateResponse(
+        request,
+        "chat.html",
+        {
+            "sessions": sessions,
+            "current": session,
+            "messages": msgs,
+            "summary": session.summary,
+            "summary_up_to_msg_id": session.summary_up_to_msg_id,
+            "active_job": bool(active),
+        },
+    )
+
+
+@app.post("/chat/{sid}/delete")
+async def chat_delete(sid: str):
+    await jobs_mod.cancel(sid)
+    await asyncio.to_thread(sess_store.delete_session, sid)
+    return RedirectResponse(url="/chat", status_code=303)
+
+
+# ─── generation (background task pattern) ──────────────────────────────────
+
+
+class AskBody(BaseModel):
+    q: str
+
+
+@app.post("/chat/{sid}/ask")
+async def chat_ask(sid: str, body: AskBody):
+    """Start a background generation job for this session. Returns immediately
+    with a small payload — the actual response is consumed via /stream."""
+    session = await asyncio.to_thread(sess_store.get_session, sid)
+    if not session:
+        raise HTTPException(404, "session not found")
+    q = (body.q or "").strip()
+    if not q:
+        raise HTTPException(400, "empty question")
+
+    stores = get_stores()
+
+    async def runner(job: jobs_mod.GenJob) -> None:
+        await chat_engine.run_generation(job, stores)
+
+    try:
+        job = await jobs_mod.start(sid, q, runner)
+    except RuntimeError as e:
+        # Already a job in flight for this session.
+        raise HTTPException(409, str(e))
+    return JSONResponse({"session_id": sid, "started_at": job.started_at})
+
+
+@app.get("/chat/{sid}/stream")
+async def chat_stream(sid: str):
+    job = jobs_mod.get(sid)
+    if not job:
+        raise HTTPException(404, "no active or recent generation for this session")
+
+    async def event_gen():
+        async for evt in jobs_mod.subscribe(job):
+            yield {"event": evt["type"], "data": json.dumps(evt.get("data"))}
+
+    return EventSourceResponse(event_gen())
+
+
+@app.post("/chat/{sid}/cancel")
+async def chat_cancel(sid: str):
+    cancelled = await jobs_mod.cancel(sid)
+    return JSONResponse({"cancelled": cancelled})
+
+
+# ─── library / ingest (unchanged behavior, now async) ──────────────────────
+
+
+@app.get("/library", response_class=HTMLResponse)
+async def library(request: Request):
+    docs = await asyncio.to_thread(list_documents, get_stores())
+    total_chunks = sum(d.get("chunks", 0) for d in docs)
+    return templates.TemplateResponse(
+        request,
+        "library.html",
+        {"docs": docs, "total_chunks": total_chunks},
+    )
+
+
+@app.get("/ingest", response_class=HTMLResponse)
+async def ingest_form(request: Request):
+    return templates.TemplateResponse(
+        request, "ingest.html", {"active": bool(ingest_jobs.get_active())}
+    )
+
+
+async def _run_ingest(job: ingest_jobs.IngestJob, stores) -> dict:
+    """Ingest the job's target files one at a time, emitting progress events.
+
+    Each file is processed under the shared run lock so ingestion never competes
+    with chat generation for Ollama. The lock is acquired per-file (not for the
+    whole batch) so a chat can interleave between files. Already-ingested files
+    (matching doc_id) are skipped rather than re-embedded."""
+    targets = job.targets
+    total = len(targets)
+    await ingest_jobs.emit(job, {"type": "start", "data": {"total": total}})
+
+    # One scan of the vector store at the start; updated in-place as new docs land.
+    have = await asyncio.to_thread(existing_doc_ids, stores)
+
+    run_lock = jobs_mod._get_run_lock()
+    ingested = 0
+    skipped = 0
+    failed = 0
+    for i, p in enumerate(targets):
+        await ingest_jobs.emit(
+            job,
+            {"type": "progress", "data": {"done": i, "total": total, "name": p.name, "status": "processing"}},
+        )
+        async with run_lock:
+            res = await asyncio.to_thread(ingest_one, p, stores, known_doc_ids=have)
+        status = res.get("status")
+        if status in ("ingested", "graph_only"):
+            ingested += 1
+        elif status == "skipped":
+            skipped += 1
+        else:
+            failed += 1
+        if res.get("doc_id"):
+            have.add(res["doc_id"])
+        await ingest_jobs.emit(
+            job,
+            {
+                "type": "progress",
+                "data": {
+                    "done": i + 1,
+                    "total": total,
+                    "name": res.get("name") or p.name,
+                    "status": status,
+                    "chunks": res.get("chunks"),
+                    "entities": res.get("entities"),
+                    "relations": res.get("relations"),
+                    "error": res.get("error"),
+                },
+            },
+        )
+    return {"ingested": ingested, "skipped": skipped, "failed": failed, "total": total}
+
+
+@app.post("/ingest/start")
+async def ingest_start(
+    path: str = Form(default=""),
+    files: list[UploadFile] = File(default=[]),
+):
+    """Save any uploads, resolve the target file list, and launch a background
+    ingestion job. Returns immediately; progress is consumed via /ingest/stream."""
+    if ingest_jobs.get_active():
+        raise HTTPException(409, "an ingestion is already in progress")
+
+    targets: list[Path] = []
+
+    for f in files:
+        if not f or not f.filename:
+            continue
+        dest = config.raw_dir / Path(f.filename).name
+        with dest.open("wb") as out:
+            shutil.copyfileobj(f.file, out)
+        if dest.suffix.lower() in SUPPORTED_SUFFIXES:
+            targets.append(dest)
+
+    if path:
+        p = Path(path).expanduser()
+        if not p.exists():
+            raise HTTPException(400, f"path not found: {path}")
+        targets.extend(iter_files(p))
+
+    # De-dupe while preserving order (a path + an upload could collide).
+    seen_paths: set[str] = set()
+    unique: list[Path] = []
+    for t in targets:
+        key = str(t.resolve())
+        if key not in seen_paths:
+            seen_paths.add(key)
+            unique.append(t)
+
+    if not unique:
+        raise HTTPException(400, "no supported files to ingest")
+
+    stores = get_stores()
+
+    async def runner(job: ingest_jobs.IngestJob) -> dict:
+        return await _run_ingest(job, stores)
+
+    try:
+        job = await ingest_jobs.start(unique, runner)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    return JSONResponse({"total": len(unique), "started_at": job.started_at})
+
+
+@app.get("/ingest/stream")
+async def ingest_stream():
+    job = ingest_jobs.get()
+    if not job:
+        raise HTTPException(404, "no ingestion running")
+
+    async def event_gen():
+        async for evt in ingest_jobs.subscribe(job):
+            yield {"event": evt["type"], "data": json.dumps(evt.get("data"))}
+
+    return EventSourceResponse(event_gen())
+
+
+# ─── knowledge graph ────────────────────────────────────────────────────────
+
+
+@app.get("/graph", response_class=HTMLResponse)
+async def graph_view(request: Request, e: str = "", q: str = ""):
+    stores = get_stores()
+    counts = await asyncio.to_thread(stores.graph.counts)
+    if q.strip():
+        entities = await asyncio.to_thread(stores.graph.search_entities, q.strip(), 40)
+    else:
+        entities = await asyncio.to_thread(stores.graph.top_entities, 40)
+    detail = await asyncio.to_thread(stores.graph.entity_detail, e) if e.strip() else None
+    targets = await asyncio.to_thread(graph_backfill_targets, stores)
+    return templates.TemplateResponse(
+        request,
+        "graph.html",
+        {
+            "counts": counts,
+            "entities": entities,
+            "detail": detail,
+            "selected": e,
+            "query": q,
+            "backfill_pending": len(targets),
+            "active": bool(ingest_jobs.get_active()),
+        },
+    )
+
+
+async def _run_backfill(job: ingest_jobs.IngestJob, stores) -> dict:
+    """Build the graph for files already in the vector store, one at a time."""
+    targets = job.targets
+    total = len(targets)
+    await ingest_jobs.emit(job, {"type": "start", "data": {"total": total}})
+
+    run_lock = jobs_mod._get_run_lock()
+    ok = 0
+    failed = 0
+    for i, p in enumerate(targets):
+        await ingest_jobs.emit(
+            job,
+            {"type": "progress", "data": {"done": i, "total": total, "name": p.name, "status": "processing"}},
+        )
+        async with run_lock:
+            res = await asyncio.to_thread(extract_file_to_graph, p, stores)
+        if res.get("status") == "ingested":
+            ok += 1
+        else:
+            failed += 1
+        await ingest_jobs.emit(
+            job,
+            {
+                "type": "progress",
+                "data": {
+                    "done": i + 1,
+                    "total": total,
+                    "name": res.get("name") or p.name,
+                    "status": res.get("status"),
+                    "entities": res.get("entities"),
+                    "relations": res.get("relations"),
+                    "error": res.get("error"),
+                },
+            },
+        )
+    return {"ingested": ok, "failed": failed, "total": total}
+
+
+@app.post("/graph/build")
+async def graph_build():
+    """Backfill the graph from the existing corpus (reuses the ingestion job slot)."""
+    if ingest_jobs.get_active():
+        raise HTTPException(409, "an ingestion is already in progress")
+    stores = get_stores()
+    targets = await asyncio.to_thread(graph_backfill_targets, stores)
+    if not targets:
+        raise HTTPException(400, "graph is already up to date with the corpus")
+
+    async def runner(job: ingest_jobs.IngestJob) -> dict:
+        return await _run_backfill(job, stores)
+
+    try:
+        job = await ingest_jobs.start(targets, runner)
+    except RuntimeError as ex:
+        raise HTTPException(409, str(ex))
+    return JSONResponse({"total": len(targets), "started_at": job.started_at})
