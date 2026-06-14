@@ -37,6 +37,7 @@ def _get_fallback() -> Ollama:
             base_url=config.ollama_host,
             request_timeout=600.0,
             context_window=32768,
+            thinking=config.llm_thinking,
         )
     return _fallback_llm
 

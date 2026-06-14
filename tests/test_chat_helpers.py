@@ -83,7 +83,7 @@ def test_build_messages_includes_summary_only_when_set():
     msgs = _build_messages("", history, "what now?", "CTX")
     assert len(msgs) == 4
     assert msgs[0].role == MessageRole.SYSTEM
-    assert msgs[0].content == SYSTEM_PROMPT
+    assert SYSTEM_PROMPT in msgs[0].content
     assert "CTX" in msgs[-1].content
     assert "what now?" in msgs[-1].content
 

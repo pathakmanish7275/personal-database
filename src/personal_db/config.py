@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 import os
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -21,12 +22,36 @@ def _path(env_key: str, default: str) -> Path:
 
 
 class Config(BaseModel):
-    # LLM provider: "ollama" (local gpt-oss:20b) or "gemini" (cloud, free tier).
+    # LLM provider: "ollama" (local) or "gemini" / "openai" / "anthropic" (cloud).
     # Embeddings stay local via Ollama regardless of provider.
     llm_provider: str = Field(default_factory=lambda: os.getenv("LLM_PROVIDER", "ollama").lower())
     ollama_host: str = Field(default_factory=lambda: os.getenv("OLLAMA_HOST", "http://localhost:11434"))
-    llm_model: str = Field(default_factory=lambda: os.getenv("LLM_MODEL", "gpt-oss:20b"))
+    llm_model: str = Field(default_factory=lambda: os.getenv("LLM_MODEL", "qwen3.5:4b"))
     embed_model: str = Field(default_factory=lambda: os.getenv("EMBED_MODEL", "nomic-embed-text"))
+    # Controls thinking for Ollama models that support it (e.g. qwen3.5).
+    # "auto" → False for ≥4b (disable thinking), None for :2b (omit the flag,
+    # because 2b stops using tools when thinking is fully off).
+    # Explicitly set LLM_THINKING=true|false to override.
+    llm_thinking: Optional[bool] = Field(default=None)
+
+    @model_validator(mode="after")
+    def _resolve_thinking(self) -> "Config":
+        raw = os.getenv("LLM_THINKING", "auto").lower()
+        if raw == "auto":
+            # Only touch the think param for models that actually support it.
+            # For everything else (gpt-oss, llama, mistral, gemma…) leave None
+            # so Ollama never sees the flag.
+            _thinking_families = ("qwen3", "qwq", "deepseek-r1")
+            is_thinking_model = any(f in self.llm_model.lower() for f in _thinking_families)
+            if is_thinking_model:
+                # 2b variant loses tool-use when thinking is fully off — omit the flag.
+                self.llm_thinking = None if ":2b" in self.llm_model else False
+        elif raw in ("true", "1", "yes"):
+            self.llm_thinking = True
+        elif raw in ("false", "0", "no"):
+            self.llm_thinking = False
+        # else: leave as None (omit the param entirely)
+        return self
 
     # Gemini (free tier covers gemini-2.5-flash and gemini-2.5-flash-lite).
     gemini_model: str = Field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"))

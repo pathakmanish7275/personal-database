@@ -34,6 +34,8 @@ from .. import ingest_jobs
 from .. import jobs as jobs_mod
 from .. import sessions as sess_store
 from ..config import config
+from ..retrieve import hybrid_retrieve, vector_retrieve
+from ..stores import configure_llama_index
 from ..ingest import (
     SUPPORTED_SUFFIXES,
     existing_doc_ids,
@@ -48,7 +50,7 @@ from ..stores import init_stores
 WEB_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(WEB_DIR / "templates"))
 
-app = FastAPI(title="Personal Database", docs_url=None, redoc_url=None)
+app = FastAPI(title="Personal Database", docs_url="/docs", redoc_url=None)
 app.mount("/static", StaticFiles(directory=str(WEB_DIR / "static")), name="static")
 
 _stores = None
@@ -412,3 +414,83 @@ async def graph_build():
     except RuntimeError as ex:
         raise HTTPException(409, str(ex))
     return JSONResponse({"total": len(targets), "started_at": job.started_at})
+
+
+# ─── search API ─────────────────────────────────────────────────────────────
+
+
+class SearchBody(BaseModel):
+    q: str
+    mode: str = "hybrid"  # "hybrid" | "vector"
+    top_k: int | None = None
+
+
+def _search_response(q: str, mode: str, top_k: int | None) -> dict:
+    """Run retrieval and return a serialisable dict."""
+    configure_llama_index()
+    stores = get_stores()
+
+    if mode == "vector":
+        from ..retrieve import RetrievalContext
+        chunks = vector_retrieve(q, stores)
+        if top_k:
+            chunks = chunks[:top_k]
+        ctx = RetrievalContext(chunks=chunks, semantic_chunk_count=len(chunks))
+    else:
+        ctx = hybrid_retrieve(q, stores)
+        if top_k:
+            ctx.chunks = ctx.chunks[:top_k]
+
+    return {
+        "query": q,
+        "mode": mode,
+        "semantic_count": ctx.semantic_chunk_count,
+        "graph_count": ctx.graph_chunk_count,
+        "query_entities": ctx.query_entities,
+        "chunks": [
+            {
+                "rank": i + 1,
+                "text": c.text,
+                "name": c.name,
+                "path": c.path,
+                "doc_id": c.doc_id,
+                "vector_score": c.vector_score,
+                "graph_hits": c.graph_hits,
+                "origin": c.origin,
+            }
+            for i, c in enumerate(ctx.chunks)
+        ],
+        "relations": [
+            {"head": h, "predicate": p, "tail": t} for h, p, t in ctx.relations
+        ],
+    }
+
+
+@app.get("/api/search")
+async def search_get(q: str, mode: str = "hybrid", top_k: int | None = None):
+    """Semantic (or hybrid) search over the corpus.
+
+    - **q**: search query
+    - **mode**: `hybrid` (vector + graph, default) or `vector` (vector only)
+    - **top_k**: max chunks to return (defaults to server config)
+
+    Example: `curl "http://localhost:8765/api/search?q=WebRTC+signalling"`
+    """
+    if not q.strip():
+        raise HTTPException(400, "q must not be empty")
+    result = await asyncio.to_thread(_search_response, q.strip(), mode, top_k)
+    return JSONResponse(result)
+
+
+@app.post("/api/search")
+async def search_post(body: SearchBody):
+    """Same as GET /api/search but accepts a JSON body — easier for scripts.
+
+    ```json
+    {"q": "WebRTC signalling", "mode": "hybrid", "top_k": 5}
+    ```
+    """
+    if not body.q.strip():
+        raise HTTPException(400, "q must not be empty")
+    result = await asyncio.to_thread(_search_response, body.q.strip(), body.mode, body.top_k)
+    return JSONResponse(result)
