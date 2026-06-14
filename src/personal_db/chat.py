@@ -47,7 +47,9 @@ plainly ("I don't see that in your notes") rather than guessing.
 For general-knowledge questions answer normally and prefix the answer with
 [general knowledge].
 
-Style: concise, direct, no preamble like "Sure!" or "Here's the answer:"."""
+Style: concise, direct, no preamble like "Sure!" or "Here's the answer:".
+Do not use markdown formatting — no asterisks, no bold, no italics, no bullet
+symbols, no headers. Write in plain prose."""
 
 
 # ─── prompt formatting (kept pure for unit tests) ──────────────────────────
