@@ -11,9 +11,10 @@ Everything runs on your machine. Your data never leaves.
 - **Ingest** any mix of Markdown, PDF, and text files into a local vector index (Qdrant embedded) and a knowledge graph (Kuzu embedded).
 - **Ask** natural-language questions and get answers grounded in your documents, with source citations.
 - **Hybrid retrieval**: every query fires a semantic vector search and a graph traversal simultaneously. Results are fused via Reciprocal Rank Fusion (RRF) before the LLM ever sees them.
-- **Agentic planner**: before each retrieval, an LLM planner decides whether the question is specific enough to search on, or whether a clarifying question would produce a better answer.
+- **Agentic retrieval**: the knowledge base is exposed to the model as a *tool*, not a fixed pipeline stage. The model decides whether to search at all, writes its own query, may search again with better terms, or asks a clarifying question — so greetings and general-knowledge questions skip retrieval entirely instead of paying for it.
 - **Knowledge graph**: entities (people, projects, tools, concepts, decisions…) and relations are extracted automatically from every ingested document using GLiNER (NER) and REBEL (relation extraction) — no LLM needed for extraction.
 - **Provider flexibility**: use a local Ollama model by default. Switch to Gemini, OpenAI, or Anthropic with a single env var, with automatic fallback to local Ollama on API outage.
+- **Voice and text, one assistant**: press Call on the chat page and talk. A spoken turn runs the *same* agent, searches the *same* knowledge base, and lands in the *same* conversation thread — so you can ask by voice and follow up by typing. Speech-to-text and text-to-speech are local; nothing leaves the machine.
 - **Memory compaction**: long conversations are summarized automatically so context stays coherent without ballooning token counts.
 
 ---
@@ -24,7 +25,7 @@ Everything runs on your machine. Your data never leaves.
 Browser
   │
   ▼
-FastAPI + Jinja2 web UI  (localhost:8000)
+FastAPI + Jinja2 web UI  (localhost:8765)
   │
   ├── POST /ingest/start  ──► background asyncio task (SSE progress)
   │                              │
@@ -35,16 +36,25 @@ FastAPI + Jinja2 web UI  (localhost:8000)
   │                                    ├── GLiNER  → entities (person/project/tool/concept/…)
   │                                    └── REBEL   → relations (head─predicate→tail)
   │
-  └── POST /chat/stream   ──► background asyncio task (SSE tokens)
+  └── POST /chat/{sid}/ask ──► background asyncio task; GET /chat/{sid}/stream (SSE)
                                │
                                ├── 1. Memory compaction (summarize old turns if budget exceeded)
-                               ├── 2. Planner LLM call → clarify | search with refined query
-                               ├── 3. Hybrid retrieval (parallel)
-                               │     ├── vector_retrieve  → Qdrant top-k
-                               │     └── graph_retrieve   → Kuzu entity match → chunk lookup
-                               │                          → RRF fusion
-                               ├── 4. LLM stream (primary provider → Ollama fallback)
-                               └── 5. Persist message + citations to SQLite
+                               └── 2. Agent loop — the model drives retrieval as a tool
+                                     │
+                                     ├── turn 0: model sees `search_kb` and decides
+                                     │     ├── answers directly  → greetings, general
+                                     │     │                       knowledge, follow-ups
+                                     │     │                       (no retrieval at all)
+                                     │     ├── asks a clarifying question (no tool call)
+                                     │     └── emits tool_call(search_kb, query)
+                                     │           │
+                                     │           └── hybrid retrieval (parallel)
+                                     │                 ├── vector_retrieve → Qdrant top-k
+                                     │                 └── graph_retrieve  → Kuzu entities
+                                     │                                     → RRF fusion
+                                     ├── turn 1..N: passages fed back; model answers
+                                     │              or searches once more (capped)
+                                     └── persist message + accumulated citations → SQLite
 
 
 Stores (all embedded, zero ops):
@@ -60,7 +70,7 @@ Stores (all embedded, zero ops):
 - **Python 3.11** (3.12 works; 3.13+ not yet supported by all ML deps)
 - **[Ollama](https://ollama.com)** running locally — used for embeddings regardless of which LLM provider you choose
 - **[uv](https://docs.astral.sh/uv/)** for dependency management
-- 8 GB RAM minimum; 16 GB recommended for the default 20B model
+- 8 GB RAM minimum; 16 GB recommended. The default chat model is a 4B; larger models need proportionally more
 
 ---
 
@@ -76,7 +86,7 @@ uv sync
 
 # 3. Pull the embedding model (required) and your preferred chat model
 ollama pull nomic-embed-text
-ollama pull gpt-oss:20b          # or any model — see LLM_MODEL in .env
+ollama pull qwen3.5:4b           # chat model — must support tool calling
 
 # 4. Configure
 cp .env.example .env
@@ -84,7 +94,7 @@ cp .env.example .env
 
 # 5. Run
 ./run.sh
-# → open http://localhost:8000
+# → open http://localhost:8765
 ```
 
 ---
@@ -108,7 +118,7 @@ If the chosen provider fails at startup (missing key, network issue), the system
 ```env
 LLM_PROVIDER=ollama
 OLLAMA_HOST=http://localhost:11434
-LLM_MODEL=gpt-oss:20b
+LLM_MODEL=qwen3.5:4b          # must support tool calling
 EMBED_MODEL=nomic-embed-text
 ```
 
@@ -184,7 +194,7 @@ Add the corresponding config fields to `config.py` and the LlamaIndex integratio
 |---|---|---|
 | `LLM_PROVIDER` | `ollama` | Active LLM provider |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama API base URL |
-| `LLM_MODEL` | `gpt-oss:20b` | Ollama model for chat |
+| `LLM_MODEL` | `qwen3.5:4b` | Chat model — must support tool calling |
 | `EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model |
 | `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Gemini model name |
 | `GEMINI_API_KEY` | _(empty)_ | Gemini API key |
@@ -202,6 +212,19 @@ Add the corresponding config fields to `config.py` and the LlamaIndex integratio
 | `CHUNK_SIZE` | `512` | Tokens per chunk |
 | `CHUNK_OVERLAP` | `64` | Overlap between chunks |
 | `MIN_SIMILARITY_SCORE` | `0.45` | Vector score threshold |
+| `LLM_HOST` | _(= `OLLAMA_HOST`)_ | Chat-model server; point at FLM to run on the NPU |
+| `FALLBACK_LLM_HOST` | _(= `OLLAMA_HOST`)_ | Where the fallback model lives |
+| `FALLBACK_LLM_MODEL` | `qwen3.5:4b` | Fallback chat model |
+| `MAX_TOOL_TURNS` | `2` | Max `search_kb` calls per turn |
+| `VOICE_ENABLED` | `true` | Enable the Call button |
+| `STT_BASE_URL` | `http://localhost:8123/v1` | Speech-to-text server |
+| `TTS_BASE_URL` | `http://localhost:8880/v1` | Text-to-speech server |
+| `VOICE_THINK` | `false` | Request reasoning on voice turns |
+| `VOICE_ANSWER_MAX_TOKENS` | `300` | Keeps spoken answers short |
+| `THINK_TOOL_TURNS` | `true` | Request reasoning on the opening turn |
+| `THINK_ANSWER` | `false` | Request reasoning while synthesising |
+| `TOOL_TURN_MAX_TOKENS` | `768` | Output cap on a tool turn (stops reasoning spirals) |
+| `ANSWER_MAX_TOKENS` | `0` | Output cap on the answer; 0 = uncapped |
 | `MEMORY_TOKEN_BUDGET` | `4000` | Tokens before compaction triggers |
 | `MEMORY_KEEP_RECENT_TURNS` | `2` | Verbatim turns kept after compaction |
 | `MEMORY_SUMMARY_MAX_CHARS` | `2400` | Max characters in compressed summary |
@@ -275,14 +298,42 @@ REBEL is large (~1.5 GB). To skip relation extraction and only run entity extrac
 
 ---
 
-## Agentic planner
+## Agentic retrieval
 
-Every chat turn runs a fast LLM call before retrieval to decide:
+Retrieval is a **tool the model calls**, not a fixed pipeline stage. Each turn the
+model is handed one tool, `search_kb`, and decides for itself what to do:
 
-- **search** — the question is specific enough; rewrites it into a short keyword-rich query stripped of pronouns and filler, then fires retrieval.
-- **clarify** — the question is genuinely ambiguous (a pronoun without antecedent, a topic with two equally-valid interpretations). Returns one follow-up question; no retrieval runs until the user replies.
+- **answer directly** — greetings, general knowledge, or anything answerable from
+  the conversation so far. No retrieval runs, so these turns are fast.
+- **call `search_kb`** — it writes its own query, reads the returned passages, and
+  either answers or searches once more with better terms.
+- **ask a clarifying question** — needs no special path; it is simply the model
+  answering without calling the tool.
 
-A hard anti-loop guard prevents the planner from asking the same clarification twice: if the prior assistant turn was a clarification (detected via a `citations=NULL` marker in the DB), the planner is forced to treat the user's reply as the answer and proceed to search.
+This replaced an earlier design that ran a separate planner LLM call before every
+retrieval. That call cost ~31% of each turn's latency and was paid even when the
+answer was obviously "just search" — or when no search was needed at all.
+
+**Requirements.** This needs a model with tool-calling support, reached over the
+**OpenAI-format** endpoint (`/v1/chat/completions`). FLM's Ollama-format
+`/api/chat` silently *drops* the `tools` array — the model never learns the tools
+exist. `qwen3.5` supports tool calling; `gpt-oss` does not.
+
+**Guards.** Each drawn from a failure seen against the live model:
+
+| guard | why |
+|---|---|
+| `MAX_TOOL_TURNS` (2) | bounds how many searches one turn may run |
+| repeated-query detection | re-running an exhausted query cannot yield new context |
+| placeholder rejection | a model once echoed an unfilled `<…>` template into the query |
+| `TOOL_TURN_MAX_TOKENS` (768) | a thinking turn otherwise spiralled to the context cap — 4096 tokens / 245s, entirely inside the reasoning channel |
+| raw-question fallback | if that cap is hit before a tool call appears, search the user's own words rather than return nothing |
+| unknown tool / retrieval error | reported back to the model as text; never kills the turn |
+
+**Reasoning** is requested per role: on for the opening turn, where choosing a good
+query benefits from it, and off once passages are in hand and the model is only
+synthesising. On the OpenAI endpoint `think: true` puts reasoning in its own
+`reasoning_content` field, so it never appears in the answer.
 
 ---
 
@@ -305,7 +356,7 @@ This keeps the effective context window small without losing continuity.
 uv run pytest
 ```
 
-88 tests, covering: sessions, memory compaction, ingest, KG extraction, hybrid retrieval, planner (including anti-loop cases), LLM runtime fallback, and the web API.
+118 tests, covering: sessions, memory compaction, ingest, KG extraction, hybrid retrieval, the agent loop (tool dispatch, loop guards, token caps, fallback), the streaming wire client, LLM runtime fallback, and the web API.
 
 ---
 
@@ -325,8 +376,11 @@ src/personal_db/
 │   ├── relations.py   # REBEL wrapper
 │   └── _text.py       # Shared text utilities
 ├── retrieve.py        # Hybrid retrieval + RRF fusion
-├── planner.py         # Agentic clarify-or-search planner
-├── llm_runtime.py     # safe_chat / safe_stream_chat with fallback
+├── agent.py           # Agent loop: model drives search_kb as a tool
+├── tools.py           # search_kb schema + citation ledger
+├── llm_stream.py      # Streaming OpenAI-format client (FLM / Ollama)
+├── llm_runtime.py     # safe_chat with fallback (memory compaction)
+├── planner.py         # (legacy) pre-agent clarify-or-search planner
 ├── chat.py            # Full chat pipeline (orchestrates everything)
 └── web/
     ├── app.py         # FastAPI routes

@@ -94,13 +94,33 @@
       </div>
 
       <form id="askForm" class="ask-form">
+        <div id="voiceStrip" class="voice-strip" hidden>
+          <canvas id="callOrb" class="voice-orb" aria-hidden="true"></canvas>
+          <span class="voice-state" id="callStateText"></span>
+          <span class="voice-heard" id="callHeard"></span>
+          <span class="voice-sources" id="callSources"></span>
+          <button type="button" class="voice-icon" id="muteBtn" title="Mute microphone" aria-label="Mute microphone">
+            <span aria-hidden="true">🎤</span>
+          </button>
+          <button type="button" class="voice-icon danger" id="endBtn" title="End call" aria-label="End call">
+            <span aria-hidden="true">✕</span>
+          </button>
+        </div>
         <textarea id="q" name="q" rows="3" placeholder="Ask anything from your database…  (Enter to send · Shift+Enter for new line)" required></textarea>
-        <button type="submit">Send</button>
+        <div class="ask-actions">
+          <button type="button" id="callBtn" class="mic-btn" disabled title="Checking voice services…" aria-label="Start voice call">
+            <span aria-hidden="true">🎙</span><span class="mic-label">Talk</span>
+          </button>
+          <button type="submit" class="send-btn">Send</button>
+        </div>
       </form>
+      <audio id="botAudio" autoplay></audio>
 
+      <script src="/static/voice-orb.js?v={{ asset_v() }}"></script>
       <script>
         (function () {
           const SID = "{{ current.id }}";
+
           const form     = document.getElementById('askForm');
           const messages = document.getElementById('messages');
           const ta       = document.getElementById('q');
@@ -335,6 +355,220 @@
           });
 
           messages.scrollTop = messages.scrollHeight;
+          // ─── voice call ───────────────────────────────────────────────
+          // Voice and text are the same assistant: a spoken turn runs the same
+          // agent and is persisted to this same session, so the transcript is
+          // polled back into this same thread rather than living in its own UI.
+          (function initVoice() {
+            const callBtn   = document.getElementById('callBtn');
+            const strip     = document.getElementById('voiceStrip');
+            const stateText = document.getElementById('callStateText');
+            const heardEl   = document.getElementById('callHeard');
+            const orbCanvas = document.getElementById('callOrb');
+            const sourcesEl = document.getElementById('callSources');
+            const muteBtn   = document.getElementById('muteBtn');
+            const endBtn    = document.getElementById('endBtn');
+            const botAudio  = document.getElementById('botAudio');
+            if (!callBtn) return;
+
+            let pc = null, micStream = null, pollTimer = null, pingTimer = null;
+            let stateES = null, connecting = false, muted = false, orb = null;
+            let known = document.querySelectorAll('#messages .msg').length;
+
+            // Server state -> what the caller is told. A call is mostly waiting;
+            // naming the kind of waiting is the whole point of this bar.
+            const LABELS = {
+              connected:    'Connected',
+              listening:    'Listening…',
+              hearing:      'Hearing you…',
+              transcribing: 'Transcribing…',
+              thinking:     'Thinking…',
+              searching:    'Searching your notes',
+              speaking:     'Speaking…',
+              error:        'Something went wrong',
+            };
+
+            // A call that silently stops is the worst failure mode here: the bar
+            // keeps claiming progress while nothing is happening. Every failure
+            // path routes through this so the cause is visible on screen.
+            function fail(where, err) {
+              const msg = (err && (err.message || err.name)) || String(err || 'unknown');
+              console.error('[voice]', where, err);
+              stateText.textContent = where + ': ' + msg;
+              heardEl.textContent = '';
+              renderSources([]);
+              if (orb) orb.setState('error');
+              disconnect({ keepMessage: true });
+            }
+
+            function setBar(show) {
+              strip.hidden = !show;
+              document.querySelector('.ask-form').classList.toggle('is-live', !!show);
+            }
+
+            function renderState(ev) {
+              const label = LABELS[ev.state] || ev.state || '';
+              stateText.textContent = ev.state === 'searching' && ev.query
+                ? `${label}: ${ev.query}` : label;
+              if (orb) orb.setState(ev.state);
+              // The transcript is the one thing the caller can't check by ear.
+              if (ev.heard) heardEl.textContent = '“' + ev.heard + '”';
+              // Sources are the clearest case of "show what speech can't say":
+              // spoken answers can't carry citations, so name them on screen.
+              if (Array.isArray(ev.sources)) renderSources(ev.sources);
+              if (ev.state === 'ended') setBar(false);
+            }
+
+            fetch('/voice/status').then(r => r.json()).then(s => {
+              callBtn.disabled = !s.ready;
+              callBtn.title = s.ready ? 'Talk to your database'
+                                      : ((s.reasons || []).join('; ') || 'Voice unavailable');
+            }).catch(() => { callBtn.title = 'Voice status unavailable'; });
+
+            async function pollTranscript() {
+              try {
+                const r = await fetch(`/chat/${SID}/messages?after=${known}`);
+                if (!r.ok) return;
+                const data = await r.json();
+                (data.messages || []).forEach(m => {
+                  const div = document.createElement('div');
+                  div.className = 'msg msg-' + m.role;
+                  const content = document.createElement('div');
+                  content.className = 'content';
+                  content.innerHTML = renderCites(m.content);
+                  div.appendChild(content);
+                  messages.appendChild(div);
+                });
+                if (data.messages && data.messages.length) {
+                  known = data.total;
+                  messages.scrollTop = messages.scrollHeight;
+                }
+              } catch (_) {}
+            }
+
+            function renderSources(list) {
+              if (!sourcesEl) return;
+              if (!list || !list.length) { sourcesEl.textContent = ''; return; }
+              sourcesEl.innerHTML = list.slice(0, 4).map(s =>
+                `<span class="voice-src" title="${escapeHTML(s.path || '')}">${escapeHTML(s.name || '')}</span>`
+              ).join('');
+            }
+
+            function setMuted(v) {
+              muted = v;
+              if (micStream) micStream.getAudioTracks().forEach(tr => tr.enabled = !muted);
+              if (orb) orb.setMuted(muted);
+              muteBtn.classList.toggle('is-muted', muted);
+              muteBtn.title = muted ? 'Unmute microphone' : 'Mute microphone';
+              muteBtn.setAttribute('aria-label', muteBtn.title);
+            }
+
+            async function connect() {
+              if (connecting || pc) return;          // one call at a time
+              connecting = true;
+              callBtn.disabled = true;
+              setBar(true);
+              stateText.textContent = 'Requesting microphone…';
+              heardEl.textContent = '';
+              try {
+                micStream = await navigator.mediaDevices.getUserMedia({
+                  audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+                });
+              } catch (e) {
+                stateText.textContent = 'Microphone permission denied.';
+                callBtn.disabled = false; connecting = false;
+                return;
+              }
+              setMuted(false);
+
+              // Orb reads real levels: the mic while you speak, the reply while
+              // it plays. A fixed animation would look the same whether or not
+              // audio was actually flowing.
+              orb = new window.VoiceOrb(orbCanvas);
+              orb.addStream(micStream, (s) => s !== 'speaking');
+              orb.start();
+
+              pc = new RTCPeerConnection();
+              micStream.getAudioTracks().forEach(tr => pc.addTrack(tr, micStream));
+              pc.ontrack = (e) => {
+                botAudio.srcObject = e.streams[0];
+                if (orb) orb.addStream(e.streams[0], (s) => s === 'speaking');
+              };
+              const dc = pc.createDataChannel('chat');
+              dc.onopen = () => { pingTimer = setInterval(() => { try { dc.send('ping'); } catch (_) {} }, 1000); };
+
+              stateText.textContent = 'Connecting…';
+              try {
+                await pc.setLocalDescription(await pc.createOffer());
+                await new Promise(resolve => {
+                  if (pc.iceGatheringState === 'complete') return resolve();
+                  pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && resolve();
+                  setTimeout(resolve, 2000);
+                });
+              } catch (err) {
+                fail('Could not negotiate the connection', err);
+                return;
+              }
+
+              let answer;
+              try {
+                const resp = await fetch('/voice/offer', {
+                  method: 'POST', headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type, session_id: SID })
+                });
+                if (!resp.ok) throw new Error(await resp.text());
+                answer = await resp.json();
+              } catch (err) {
+                stateText.textContent = 'Could not start the call: ' + err.message;
+                disconnect();
+                return;
+              }
+              await pc.setRemoteDescription(answer);
+              pc.onconnectionstatechange = () => {
+                if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) disconnect();
+              };
+
+              connecting = false;
+              callBtn.classList.add('on-call');
+              callBtn.setAttribute('aria-label', 'End voice call');
+              callBtn.disabled = false;
+
+              stateES = new EventSource(`/voice/${SID}/events`);
+              stateES.addEventListener('state', e => {
+                try { renderState(JSON.parse(e.data)); } catch (_) {}
+              });
+              pollTimer = setInterval(pollTranscript, 1500);
+            }
+
+            function disconnect(opts) {
+              const keepMessage = !!(opts && opts.keepMessage);
+              connecting = false;
+              if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+              if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+              if (stateES)   { try { stateES.close(); } catch (_) {} stateES = null; }
+              if (orb)       { orb.stop(); orb = null; }
+              if (micStream) { micStream.getTracks().forEach(tr => tr.stop()); micStream = null; }
+              if (pc) { try { pc.close(); } catch (_) {} pc = null; }
+              callBtn.classList.remove('on-call');
+              callBtn.setAttribute('aria-label', 'Start voice call');
+              callBtn.disabled = false;
+              if (!keepMessage) setBar(false);
+              pollTranscript();   // catch the final turn
+            }
+
+            window.addEventListener('unhandledrejection', (ev) => {
+              if (connecting || pc) fail('Call failed', ev.reason);
+            });
+
+            callBtn.addEventListener('click', () => {
+              if (pc) { disconnect(); return; }
+              connect().catch(err => fail('Could not start the call', err));
+            });
+            endBtn.addEventListener('click', disconnect);
+            muteBtn.addEventListener('click', () => setMuted(!muted));
+            window.addEventListener('beforeunload', () => { if (pc) disconnect(); });
+          })();
+
         })();
       </script>
     {% endif %}

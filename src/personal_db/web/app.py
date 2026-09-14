@@ -19,7 +19,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Form, HTTPException, Request, UploadFile, File
@@ -32,6 +35,7 @@ from sse_starlette.sse import EventSourceResponse
 from .. import chat as chat_engine
 from .. import ingest_jobs
 from .. import jobs as jobs_mod
+from .. import llm_runtime
 from .. import sessions as sess_store
 from ..config import config
 from ..retrieve import hybrid_retrieve, vector_retrieve
@@ -50,8 +54,59 @@ from ..stores import init_stores
 WEB_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(WEB_DIR / "templates"))
 
-app = FastAPI(title="Personal Database", docs_url="/docs", redoc_url=None)
+def _asset_version() -> str:
+    """Newest mtime across static assets, as a cache-busting query value.
+
+    Without this the browser keeps serving a cached stylesheet after an edit —
+    a CSS fix can look like it simply did not work, which cost real debugging
+    time once already."""
+    newest = 0.0
+    static = WEB_DIR / "static"
+    if static.is_dir():
+        for f in static.rglob("*"):
+            if f.is_file():
+                newest = max(newest, f.stat().st_mtime)
+    return str(int(newest))
+
+
+# Recomputed per render so edits show up without a restart in development.
+templates.env.globals["asset_v"] = _asset_version
+
+# How long shutdown waits for in-flight generations before giving up. Chat
+# generations typically finish in well under a minute; the cap just bounds a
+# hung model server.
+SHUTDOWN_DRAIN_SECONDS = float(os.getenv("SHUTDOWN_DRAIN_SECONDS", "300"))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    # Safe shutdown: never abandon an in-flight LLM call. Dropping a stream
+    # mid-generation can crash the FLM/NPU server, so wait for active jobs to
+    # finish and their streams to close cleanly before the process exits.
+    try:
+        await jobs_mod.drain_all(timeout=SHUTDOWN_DRAIN_SECONDS)
+        await ingest_jobs.drain_all(timeout=SHUTDOWN_DRAIN_SECONDS)
+        # Belt-and-braces: any LLM calls outside the job system (shouldn't be
+        # any, but the counter is cheap insurance).
+        deadline = time.monotonic() + 30.0
+        while llm_runtime.active_calls() > 0 and time.monotonic() < deadline:
+            await asyncio.sleep(0.2)
+    except Exception:  # noqa: BLE001
+        import logging
+
+        logging.getLogger(__name__).exception("error during shutdown drain")
+
+
+app = FastAPI(title="Personal Database", docs_url="/docs", redoc_url=None, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(WEB_DIR / "static")), name="static")
+
+# Voice shares this app on purpose: one process means one NPU call gate covering
+# both channels, and one origin for the browser. The router is thin — pipecat
+# itself is imported lazily inside it.
+from ..voice.routes import router as voice_router  # noqa: E402
+
+app.include_router(voice_router)
 
 _stores = None
 
@@ -184,6 +239,29 @@ async def chat_stream(sid: str):
             yield {"event": evt["type"], "data": json.dumps(evt.get("data"))}
 
     return EventSourceResponse(event_gen())
+
+
+@app.get("/chat/{sid}/messages")
+async def chat_messages(sid: str, after: int = 0):
+    """Messages for a session, as JSON.
+
+    Used by the voice UI: a spoken turn is persisted by the same code path as a
+    typed one, so the page polls this during a call to show the transcript in
+    the same thread. `after` is the number of messages the client already has."""
+    session = await asyncio.to_thread(sess_store.get_session, sid)
+    if not session:
+        raise HTTPException(404, "session not found")
+    msgs = await asyncio.to_thread(sess_store.get_messages, sid)
+    out = []
+    for m in msgs[after:]:
+        out.append(
+            {
+                "role": m.role,
+                "content": m.content or "",
+                "citations": json.loads(m.citations) if m.citations else None,
+            }
+        )
+    return JSONResponse({"total": len(msgs), "messages": out})
 
 
 @app.post("/chat/{sid}/cancel")
@@ -394,6 +472,17 @@ async def _run_backfill(job: ingest_jobs.IngestJob, stores) -> dict:
             },
         )
     return {"ingested": ok, "failed": failed, "total": total}
+
+
+@app.get("/api/graph/data")
+async def graph_data(limit: int = 120):
+    """Nodes + edges for the graph visualisation."""
+    stores = get_stores()
+    if not stores.graph:
+        return JSONResponse({"nodes": [], "edges": [], "enabled": False})
+    snap = await asyncio.to_thread(stores.graph.graph_snapshot, limit)
+    snap["enabled"] = True
+    return JSONResponse(snap)
 
 
 @app.post("/graph/build")

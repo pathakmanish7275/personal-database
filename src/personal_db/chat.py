@@ -8,41 +8,57 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 from llama_index.core.llms import ChatMessage, MessageRole
 
 from . import jobs as jobs_mod
 from . import memory as memory_agent
 from . import sessions as sess_store
-from . import planner as planner_mod
-from .llm_runtime import safe_stream_chat
+from .agent import AgentRunner
+from .config import config
 from .retrieve import RetrievedChunk, hybrid_retrieve
 from .stores import Stores, configure_llama_index
 
+log = logging.getLogger(__name__)
+
 SYSTEM_PROMPT = """You are Alex's local personal-database assistant.
 
-Two sources of context arrive with every question:
+You have one tool, search_kb, which searches Alex's own documents — his
+notes, journals, PDFs and books.
 
-1. Retrieved chunks — labeled  [N] <filename>\\n<text>.  The filename matters:
-   it tells you which of Alex's documents the chunk came from. Retrieval
-   errs on the side of recall, so some chunks may be tangential. Read each
-   one, then SILENTLY DISCARD any chunk whose content does not directly help
-   answer the question, even if it shares keywords. Never mix facts from
-   different documents unless explicitly asked to compare.
+When to search:
+- Search whenever the question concerns Alex's own material: his notes,
+  projects, decisions, history, or anything he has written down.
+- Do NOT search for greetings, small talk, or questions you can answer from
+  general knowledge alone.
+- Questions about Alex himself — who he is, what he does, what he is working
+  on — are knowledge-base questions. Search for them. You know nothing about
+  him beyond what the documents say; his name appearing above is not knowledge
+  about him.
+- Do NOT search to answer a question about the conversation you are already
+  having.
+- If the question is too vague to search usefully, ask Alex a short
+  clarifying question instead of guessing a query.
 
-2. Known relations from the graph — a short list of structured facts written as
-   entity ─predicate→ entity.  These come from connections recorded across
-   Alex's notes by a non-LLM extractor, so some can be noisy. Use them to
-   fill in links the chunks alone don't state, but don't quote them verbatim
-   and don't cite them.
+Search results arrive as passages labeled  [N] <filename>\\n<text>, sometimes
+followed by relations from the knowledge graph written as
+entity ─predicate→ entity. Retrieval errs on the side of recall, so some
+passages will be tangential: read each one, then SILENTLY DISCARD any that does
+not directly help, even if it shares keywords. Never mix facts from different
+documents unless asked to compare. The graph relations come from a non-LLM
+extractor and can be noisy — use them to fill in links the passages don't
+state, but don't quote them and don't cite them.
 
 Citation rules:
-- Cite chunks inline as [1], [2] matching only the chunks you actually used.
-- Do NOT cite a chunk you discarded.
-- Do NOT cite the relations block.
+- Cite passages inline as [1], [2], using the numbers they were given.
+- Cite only passages you actually used; never cite one you discarded.
+- Never cite the relations block.
 
-If, after discarding tangential chunks, no useful context remains, say so
-plainly ("I don't see that in your notes") rather than guessing.
+If a search returns nothing useful, say so plainly ("I don't see that in your
+notes") rather than guessing. You may search once more with different terms if
+the first query was poorly chosen, but do not repeat a search that already
+failed.
 
 For general-knowledge questions answer normally and prefix the answer with
 [general knowledge].
@@ -132,6 +148,73 @@ def _build_messages(
     return msgs
 
 
+def _build_agent_messages(
+    summary: str,
+    recent: list[sess_store.Message],
+    user_text: str,
+) -> list[dict]:
+    """Build the OpenAI-format message list for the agent loop.
+
+    No context block: retrieval is a tool the model calls, not something we
+    pre-stuff into the prompt. Plain dicts rather than ChatMessage because the
+    agent talks to /v1/chat/completions directly — the LlamaIndex Ollama client
+    targets /api/chat, which silently drops the tools array."""
+    msgs: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if summary.strip():
+        msgs.append(
+            {
+                "role": "system",
+                "content": (
+                    "Memory of earlier turns in this session (compressed):\n\n"
+                    f"{summary.strip()}"
+                ),
+            }
+        )
+    for m in recent:
+        msgs.append(
+            {"role": "user" if m.role == "user" else "assistant", "content": m.content}
+        )
+    msgs.append({"role": "user", "content": user_text})
+    return msgs
+
+
+VOICE_SYSTEM_PROMPT = """You are Alex's local personal-database assistant, speaking aloud.
+
+You have one tool, search_kb, which searches Alex's own documents — his notes,
+journals, PDFs and books. Search whenever the question concerns his own
+material — including questions about Alex himself, such as who he is or what
+he works on, which you can only answer from his documents. Do not search for
+greetings, small talk, or general knowledge.
+
+You are being heard, not read. This changes how you answer:
+- Two or three sentences. Never more unless asked to go on.
+- Plain spoken English. No markdown, no bullet points, no headings, no
+  asterisks — they get read out as noise.
+- Never speak citation markers like [1]. Name the document instead, naturally:
+  "your architecture notes say…".
+- Spell out anything that would be unclear when heard: say "twelve percent",
+  not "12%".
+- If a search finds nothing useful, say so in one sentence.
+- If the question is too vague to search, ask one short clarifying question.
+
+Do not narrate what you are about to do. Answer."""
+
+
+def build_voice_messages(
+    summary: str,
+    recent: list[sess_store.Message],
+    user_text: str,
+) -> list[dict]:
+    """Agent messages for a spoken turn.
+
+    Identical to the text path except for the system prompt, so voice and text
+    share one conversation history — a voice turn is visible in the chat
+    transcript and can be followed up in text, and vice versa."""
+    msgs = _build_agent_messages(summary, recent, user_text)
+    msgs[0] = {"role": "system", "content": VOICE_SYSTEM_PROMPT}
+    return msgs
+
+
 # ─── the async runner used by jobs.start ──────────────────────────────────
 
 
@@ -168,88 +251,98 @@ async def run_generation(job: jobs_mod.GenJob, stores: Stores) -> None:
             },
         )
 
-    # 3) Plan — figure out if the question is searchable, or if we should ask
-    #    a clarifying question first. On any planner failure we fall through to
-    #    a search on the raw question.
-    await jobs_mod.emit(
-        job, {"type": "status", "data": {"phase": "planning", "text": "understanding your question…"}}
-    )
-    # If the prior assistant turn was a clarification (citations stored as NULL),
-    # this user message is the reply — tell the planner so it doesn't re-ask.
-    prior_clarify = _previous_clarification(compacted.recent)
-    plan = await asyncio.to_thread(
-        planner_mod.plan, job.user_text, compacted.recent, prior_clarify
-    )
-    if plan.action == "clarify":
-        # Skip retrieval + synthesis; the clarification IS this turn's response.
-        await jobs_mod.emit(
-            job,
-            {"type": "clarify", "data": {"reason": plan.reason}},
-        )
-        await jobs_mod.emit(job, {"type": "token", "data": plan.clarify or ""})
-        await asyncio.to_thread(
-            sess_store.add_message, job.session_id, "assistant", plan.clarify or "", None
-        )
-        return
-
-    retrieval_query = plan.query or job.user_text
-    if retrieval_query != job.user_text:
-        await jobs_mod.emit(
-            job,
-            {"type": "status", "data": {"phase": "planning", "text": f"refined: {retrieval_query[:80]}"}},
-        )
-
-    # 4) Hybrid retrieval — vector + graph fire together inside the worker thread.
-    await jobs_mod.emit(
-        job, {"type": "status", "data": {"phase": "retrieving", "text": "searching docs + graph"}}
-    )
-    ctx = await asyncio.to_thread(hybrid_retrieve, retrieval_query, stores)
-    context_block, cites = _format_context(ctx.chunks)
-    relations_block = _format_relations(ctx.relations)
-    await jobs_mod.emit(job, {"type": "citations", "data": cites})
-    # Always emit a dedicated `graph` event when the KG is enabled — even when
-    # the graph didn't contribute — so the UI can show that it was consulted.
-    from .config import config as _cfg
-    if _cfg.kg_enabled and stores.graph is not None:
-        await jobs_mod.emit(
-            job,
-            {
-                "type": "graph",
-                "data": {
-                    "entities": ctx.query_entities,
-                    "chunks": ctx.graph_chunk_count,
-                    "relations": len(ctx.relations),
-                    "semantic_chunks": ctx.semantic_chunk_count,
-                },
-            },
-        )
-
-    # 4) Build the chat messages and stream the LLM response.
-    messages = _build_messages(
-        compacted.summary, compacted.recent, job.user_text, context_block, relations_block
-    )
+    # 3) Agentic turn. The model is handed `search_kb` as a real tool and
+    #    decides for itself whether to search, how to phrase the query, whether
+    #    to search again, or to answer directly. Asking a clarifying question
+    #    needs no special case — it is just the model answering without
+    #    calling the tool.
     await jobs_mod.emit(
         job, {"type": "status", "data": {"phase": "thinking", "text": "thinking"}}
     )
 
-    response_stream = await asyncio.to_thread(safe_stream_chat, messages)
-    full_text_parts: list[str] = []
-    iterator = iter(response_stream)
+    messages = _build_agent_messages(compacted.summary, compacted.recent, job.user_text)
 
-    def _next_chunk():
+    def _retrieve(query: str):
+        return hybrid_retrieve(query, stores)
+
+    runner = AgentRunner(
+        base_url=config.llm_host,
+        model=config.llm_model,
+        retrieve=_retrieve,
+        max_tool_turns=config.max_tool_turns,
+        think_tools=config.think_tool_turns,
+        think_answer=config.think_answer,
+        fallback_base_url=config.fallback_llm_host,
+        fallback_model=config.fallback_llm_model,
+        tool_turn_max_tokens=config.tool_turn_max_tokens,
+        answer_max_tokens=config.answer_max_tokens or None,
+    )
+
+    # From here on a stream to the model server may be open. Cancel must be
+    # cooperative: hard-cancelling would drop the HTTP stream mid-generation.
+    job.streaming = True
+    events = runner.run(messages)
+    full_text_parts: list[str] = []
+    cites: list[dict] = []
+    cancelled = False
+
+    def _next_event():
         try:
-            return next(iterator)
+            return next(events)
         except StopIteration:
             return None
 
-    while True:
-        chunk = await asyncio.to_thread(_next_chunk)
-        if chunk is None:
-            break
-        delta = chunk.delta or ""
-        if delta:
-            full_text_parts.append(delta)
-            await jobs_mod.emit(job, {"type": "token", "data": delta})
+    try:
+        while True:
+            ev = await asyncio.to_thread(_next_event)
+            if ev is None:
+                break
+            if job.cancel_requested and not cancelled:
+                # Stop emitting/persisting but keep draining, so the model
+                # server finishes its generation cleanly.
+                cancelled = True
+                full_text_parts.clear()
+                log.info("job %s cancelled mid-turn; draining", job.session_id)
+            if cancelled:
+                continue
+
+            if ev.kind == "token":
+                full_text_parts.append(ev.text)
+                await jobs_mod.emit(job, {"type": "token", "data": ev.text})
+            elif ev.kind == "reasoning":
+                # Reasoning arrives on its own channel and is never part of the
+                # answer; surface it as status only so the UI can show life.
+                await jobs_mod.emit(
+                    job, {"type": "reasoning", "data": ev.text}
+                )
+            elif ev.kind == "searching":
+                await jobs_mod.emit(
+                    job,
+                    {
+                        "type": "status",
+                        "data": {"phase": "retrieving", "text": f"searching: {ev.query[:80]}"},
+                    },
+                )
+            elif ev.kind == "citations":
+                cites = ev.cites
+                await jobs_mod.emit(job, {"type": "citations", "data": cites})
+            elif ev.kind == "done" and ev.finish_reason == "length":
+                log.warning(
+                    "job %s hit the model's output cap", job.session_id
+                )
+    finally:
+        # The agent holds the process-wide LLM gate for the life of each
+        # request. If we leave by any path other than exhausting the generator,
+        # close it explicitly — leaving it to GC would gate every future LLM
+        # call in the process on refcount timing.
+        job.streaming = False
+        try:
+            await asyncio.to_thread(events.close)
+        except Exception:  # noqa: BLE001
+            # Already-exhausted is a no-op; "generator already executing" means
+            # a worker thread still holds it and will release the gate itself.
+            # Never let cleanup mask the exception that brought us here.
+            log.debug("closing agent stream for job %s failed", job.session_id, exc_info=True)
 
     # 5) Persist the assistant message (citations included).
     full_text = "".join(full_text_parts)
