@@ -14,3 +14,4 @@ wheels/
 
 # Local data (vector + graph stores, raw uploads, session DB)
 data/
+

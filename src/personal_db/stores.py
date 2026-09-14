@@ -29,7 +29,7 @@ class Stores:
 def _ollama_llm() -> Ollama:
     return Ollama(
         model=config.llm_model,
-        base_url=config.ollama_host,
+        base_url=config.llm_host,
         request_timeout=600.0,
         context_window=32768,
         thinking=config.llm_thinking,

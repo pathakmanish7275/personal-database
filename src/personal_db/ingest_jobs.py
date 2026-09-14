@@ -121,6 +121,19 @@ async def cancel() -> bool:
     return True
 
 
+async def drain_all(timeout: float = 300.0) -> None:
+    """Wait for the active ingestion (if any) to finish, up to `timeout`.
+
+    Used on shutdown so ingestion state stays consistent and any Ollama
+    embedding call in progress is never abandoned mid-request."""
+    task = _current.task if _current else None
+    if task and not task.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except (asyncio.TimeoutError, Exception):
+            pass
+
+
 async def subscribe(job: IngestJob) -> AsyncIterator[dict]:
     """Yield SSE events for this job, replaying history first then streaming new
     ones until done. Reconnecting clients always see the full log from index 0."""

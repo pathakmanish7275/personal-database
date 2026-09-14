@@ -56,6 +56,12 @@ class GenJob:
     finished_at: float | None = None
     # Set whenever events is appended or done flips True. Subscribers wait on this.
     pulse: asyncio.Event = field(default_factory=asyncio.Event)
+    # Cooperative cancel: set by cancel()/shutdown. While `streaming` is True
+    # (an LLM stream is open) we must NOT hard-cancel — dropping the stream
+    # mid-generation can crash the FLM/NPU server. The runner drains the
+    # stream instead and exits when it sees the flag.
+    cancel_requested: bool = False
+    streaming: bool = False
 
 
 # session_id -> GenJob
@@ -147,16 +153,52 @@ async def start(
 
 
 async def cancel(session_id: str) -> bool:
-    """Cancel the active job for this session, if any. Returns True if cancelled."""
+    """Cancel the active job for this session, if any. Returns True if cancelled.
+
+    Before the LLM stream opens (`streaming=False`) we hard-cancel the task —
+    nothing is mid-generation on the NPU yet. Once streaming, cancel is
+    cooperative: the runner stops emitting tokens and drains the stream to
+    completion, because aborting the HTTP stream can crash the FLM server."""
     job = _jobs.get(session_id)
     if not job or job.done or job.task is None:
         return False
+    first_cancel = not job.cancel_requested
+    job.cancel_requested = True
+    if job.streaming:
+        if first_cancel:
+            await emit(
+                job,
+                {"type": "status", "data": {"phase": "cancelled", "text": "cancelled — waiting for the model to finish safely"}},
+            )
+        # Do not await the task: draining may take up to a minute.
+        return True
     job.task.cancel()
     try:
         await job.task
     except (asyncio.CancelledError, Exception):
         pass
     return True
+
+
+async def drain_all(timeout: float = 300.0) -> None:
+    """Wait for every active job to finish, up to `timeout`.
+
+    Used on shutdown: lets in-flight LLM generations complete (and their
+    streams close cleanly) before the process exits, so the model server is
+    never abandoned mid-call. Returns after the timeout with jobs still running."""
+    tasks = [
+        j.task
+        for j in _jobs.values()
+        if j.task is not None and not j.task.done()
+    ]
+    if tasks:
+        log.info("shutdown: waiting for %d in-flight job(s) to drain", len(tasks))
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        if pending:
+            log.warning(
+                "shutdown: %d job(s) still running after %.0fs — proceeding",
+                len(pending), timeout,
+            )
 
 
 async def subscribe(job: GenJob) -> AsyncIterator[dict]:

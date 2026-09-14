@@ -10,7 +10,22 @@ from pydantic import BaseModel, Field, model_validator
 import os
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-load_dotenv(PROJECT_ROOT / ".env")
+# override=True: .env is the project's source of truth. Without it, stray
+# exported vars in the desktop session (e.g. a stale LLM_MODEL) silently
+# shadow the project config.
+load_dotenv(PROJECT_ROOT / ".env", override=True)
+
+
+def _opt_bool(raw: str | None) -> Optional[bool]:
+    """Parse a tri-state flag: true / false / unset (omit the parameter)."""
+    if raw is None:
+        return None
+    v = raw.strip().lower()
+    if v in ("true", "1", "yes"):
+        return True
+    if v in ("false", "0", "no"):
+        return False
+    return None
 
 
 def _path(env_key: str, default: str) -> Path:
@@ -26,13 +41,90 @@ class Config(BaseModel):
     # Embeddings stay local via Ollama regardless of provider.
     llm_provider: str = Field(default_factory=lambda: os.getenv("LLM_PROVIDER", "ollama").lower())
     ollama_host: str = Field(default_factory=lambda: os.getenv("OLLAMA_HOST", "http://localhost:11434"))
+    # Host for the chat LLM only (Ollama-compatible API, e.g. FLM on its own
+    # port). Defaults to ollama_host; embeddings always use ollama_host.
+    llm_host: str = Field(default_factory=lambda: os.getenv("LLM_HOST", os.getenv("OLLAMA_HOST", "http://localhost:11434")))
     llm_model: str = Field(default_factory=lambda: os.getenv("LLM_MODEL", "qwen3.5:4b"))
+    # Where the Ollama fallback lives when the primary is a remote/other local
+    # server (e.g. FLM). Model must exist on that host.
+    fallback_llm_host: str = Field(default_factory=lambda: os.getenv("FALLBACK_LLM_HOST", os.getenv("OLLAMA_HOST", "http://localhost:11434")))
+    fallback_llm_model: str = Field(default_factory=lambda: os.getenv("FALLBACK_LLM_MODEL", "qwen3.5:4b"))
     embed_model: str = Field(default_factory=lambda: os.getenv("EMBED_MODEL", "nomic-embed-text"))
     # Controls thinking for Ollama models that support it (e.g. qwen3.5).
     # "auto" → False for ≥4b (disable thinking), None for :2b (omit the flag,
     # because 2b stops using tools when thinking is fully off).
     # Explicitly set LLM_THINKING=true|false to override.
     llm_thinking: Optional[bool] = Field(default=None)
+
+    # ── agent loop ─────────────────────────────────────────────────────────
+    # How many times the model may call search_kb in one turn before we make it
+    # answer with what it has. 2 allows one retry with better terms; more than
+    # that mostly buys repeated queries.
+    max_tool_turns: int = Field(
+        default_factory=lambda: int(os.getenv("MAX_TOOL_TURNS", "2"))
+    )
+    # Reasoning is requested per role, because the two turns want opposite
+    # things: choosing a good search query benefits from thinking, while
+    # synthesising an answer that is already grounded in retrieved passages
+    # mostly spends decode time on it. On FLM's /v1 endpoint `think` puts
+    # reasoning in its own `reasoning_content` field, so it never pollutes the
+    # answer either way.
+    think_tool_turns: Optional[bool] = Field(
+        default_factory=lambda: _opt_bool(os.getenv("THINK_TOOL_TURNS", "true"))
+    )
+    think_answer: Optional[bool] = Field(
+        default_factory=lambda: _opt_bool(os.getenv("THINK_ANSWER", "false"))
+    )
+    # Hard ceiling on a tool turn's output (reasoning + the tool call together).
+    # A thinking turn can otherwise spiral to the context cap: measured at 4096
+    # tokens / 245s on one vague question, entirely inside the reasoning
+    # channel. Ample for reasoning plus a short tool call.
+    tool_turn_max_tokens: int = Field(
+        default_factory=lambda: int(os.getenv("TOOL_TURN_MAX_TOKENS", "768"))
+    )
+    # 0 = uncapped; the answer itself needs room to be complete.
+    answer_max_tokens: int = Field(
+        default_factory=lambda: int(os.getenv("ANSWER_MAX_TOKENS", "0"))
+    )
+
+    # ── voice ──────────────────────────────────────────────────────────────
+    voice_enabled: bool = Field(
+        default_factory=lambda: os.getenv("VOICE_ENABLED", "true").lower()
+        in ("true", "1", "yes")
+    )
+    # STT and TTS run as separate local HTTP servers speaking the OpenAI audio
+    # API, so either can be swapped (including for a cloud provider) by URL.
+    stt_base_url: str = Field(
+        default_factory=lambda: os.getenv("STT_BASE_URL", "http://localhost:8123/v1")
+    )
+    tts_base_url: str = Field(
+        default_factory=lambda: os.getenv("TTS_BASE_URL", "http://localhost:8880/v1")
+    )
+    stt_model: str = Field(default_factory=lambda: os.getenv("STT_MODEL", "whisper-1"))
+    tts_voice: str = Field(default_factory=lambda: os.getenv("TTS_VOICE", "af_heart"))
+    # Reasoning off by default for speech: it is the largest latency cost and
+    # helps least when the answer must be two or three spoken sentences.
+    voice_think: Optional[bool] = Field(
+        default_factory=lambda: _opt_bool(os.getenv("VOICE_THINK", "false"))
+    )
+    # Spoken answers must stay short; this is a backstop for when the prompt
+    # is ignored, not the primary control.
+    voice_answer_max_tokens: int = Field(
+        default_factory=lambda: int(os.getenv("VOICE_ANSWER_MAX_TOKENS", "300"))
+    )
+    voice_greeting: str = Field(
+        default_factory=lambda: os.getenv(
+            "VOICE_GREETING", "Hey. What would you like to know?"
+        )
+    )
+    # Used when the call is placed on a conversation that already has turns —
+    # the agent carries that history, so the greeting should say so.
+    voice_resume_greeting: str = Field(
+        default_factory=lambda: os.getenv(
+            "VOICE_RESUME_GREETING",
+            "Picking up where we left off. What would you like to know?",
+        )
+    )
 
     @model_validator(mode="after")
     def _resolve_thinking(self) -> "Config":
