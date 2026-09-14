@@ -351,6 +351,51 @@ class Graph:
             out.append(tuple(res.get_next()))
         return out
 
+    def graph_snapshot(self, limit: int = 120, max_edges: int = 400) -> dict:
+        """Nodes + edges for the graph view.
+
+        Takes the most-mentioned entities and keeps only relations whose *both*
+        ends are in that set — a node-link view with dangling half-edges reads
+        as broken, and edges to off-screen nodes carry no information. Degree is
+        computed here so the renderer can size nodes by connectedness without a
+        second pass over the data."""
+        conn = self._conn()
+        ents = self.top_entities(limit)
+        by_key = {_norm_key(e["name"]): e for e in ents}
+
+        res = conn.execute(
+            """MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
+               RETURN a.name, a.label, r.predicate, b.name, b.label
+               LIMIT $lim""",
+            {"lim": max_edges * 5},
+        )
+        edges: list[dict] = []
+        degree: dict[str, int] = {}
+        seen: set[tuple] = set()
+        while res.has_next() and len(edges) < max_edges:
+            ak, al, pred, bk, bl = res.get_next()
+            if ak not in by_key or bk not in by_key or ak == bk:
+                continue
+            sig = (ak, bk, pred)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            edges.append({"source": ak, "target": bk, "predicate": _norm_pred(pred or "")})
+            degree[ak] = degree.get(ak, 0) + 1
+            degree[bk] = degree.get(bk, 0) + 1
+
+        nodes = [
+            {
+                "id": k,
+                "label": e["name"],
+                "type": e["type"] or "concept",
+                "mentions": e["mentions"],
+                "degree": degree.get(k, 0),
+            }
+            for k, e in by_key.items()
+        ]
+        return {"nodes": nodes, "edges": edges}
+
     def document_ids(self) -> set[str]:
         """doc_ids already present in the graph."""
         conn = self._conn()
