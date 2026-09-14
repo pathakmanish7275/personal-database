@@ -3,6 +3,23 @@
 {% block content %}
 <h1>Knowledge graph</h1>
 
+<!-- Visual first, list second: the point of a graph view is the shape of the
+     connections; the list below stays for precise lookup and keyboard use. -->
+<section class="kg-viz">
+  <div class="kg-viz-head">
+    <input type="search" id="kgFilter" class="kg-filter" placeholder="Highlight entities…" autocomplete="off">
+    <label class="kg-toggle">
+      <input type="checkbox" id="kgHideIsolated"> hide unconnected
+    </label>
+    <span id="kgLegend" class="kg-legend"></span>
+  </div>
+  <div class="kg-canvas-wrap">
+    <canvas id="kgCanvas"></canvas>
+    <div id="kgTip" class="kg-tip" hidden></div>
+  </div>
+  <p id="kgStatus" class="kg-status">Loading graph…</p>
+</section>
+
 <div class="graph-stats">
   <div class="stat"><span class="stat-value">{{ counts.documents }}</span><span class="stat-label">docs</span></div>
   <div class="stat"><span class="stat-value">{{ counts.entities }}</span><span class="stat-label">entities</span></div>
@@ -157,4 +174,5 @@
   {% endif %}
 })();
 </script>
+<script src="/static/graph.js?v={{ asset_v() }}" defer></script>
 {% endblock %}
