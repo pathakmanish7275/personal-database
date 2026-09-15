@@ -37,9 +37,10 @@ Config knobs added (`src/personal_db/config.py`):
 - `fallback_llm_host` (`FALLBACK_LLM_HOST`) — where the fallback lives.
 - `fallback_llm_model` (`FALLBACK_LLM_MODEL`) — fallback model (must exist on that host).
 
-Provider/fallback logic (`src/personal_db/llm_runtime.py`):
-- `_fallback_enabled()` — true for a remote primary (`gemini`) **or** when the
-  chat LLM sits on a *different* host than the fallback (the FLM case).
+Fallback logic (`src/personal_db/llm_runtime.py`):
+- `_fallback_enabled()` — purely a question of hosts: true when the chat model
+  sits on a *different* host than the fallback (the FLM case). The cloud
+  providers this once branched on are gone; everything runs locally.
 - `_primary_stream_is_unsafe()` — **removed.** Streaming is no longer emulated
   (§3a). The agent path streams through `llm_stream.stream_chat`; `llm_runtime`
   now serves only the non-tool `/api/chat` callers (memory compaction).
@@ -68,7 +69,7 @@ Fixes applied:
   manager persists across logout when kept alive by a lingering user service, so
   a plain logout was not enough — a reboot cleanly reset it.
 
-Result: `flm serve` runs as `you`, **no sudo**, and `run.sh`/`stop.sh`
+Result: `flm serve` runs as the desktop user, **no sudo**, and `run.sh`/`stop.sh`
 never prompt.
 
 ---
@@ -321,9 +322,8 @@ the right model is being served. The model itself loads lazily on first request
 - **`/etc/security/limits.d/flm.conf` does not exist** and never worked — the
   memlock limit comes from the systemd drop-in (§2). A stale comment in `run.sh`
   pointed at the PAM path; corrected.
-- **Emulated streaming means no per-token drip** on the NPU path — the answer
-  appears at once. Cloud providers (`LLM_PROVIDER=gemini`) still stream
-  normally; only FLM/`ollama-host` primaries are emulated.
+- **Emulated streaming is gone** — superseded by §3a. Tokens now stream live
+  on the NPU path; there is no longer a cloud path to contrast it with.
 - **`LLM_THINKING=auto`** disables `think` for ≥4b Qwen models and omits the
   flag for `:2b` (the 2B loses tool-use when thinking is off) — FLM ignores the
   flag anyway, so the strip in §3c is what actually keeps output clean.
