@@ -32,14 +32,14 @@ from .llm_runtime import safe_chat
 
 log = logging.getLogger(__name__)
 
-SUMMARIZER_SYSTEM = """You maintain a compact running memory of a conversation between Alex (the user) and his personal-database assistant.
+SUMMARIZER_SYSTEM = """You maintain a compact running memory of a conversation between the user and their personal-database assistant.
 
 Keep the summary tight ({max_chars} characters max). It must preserve:
-- decisions Alex made (with rationale, briefly)
-- preferences and constraints he stated (style, tools, "don't do X")
-- key facts about him, his projects, people, and any named entities raised
-- unresolved questions or threads he intends to come back to
-- corrections he gave the assistant
+- decisions the user made (with rationale, briefly)
+- preferences and constraints they stated (style, tools, "don't do X")
+- key facts about them, their projects, people, and any named entities raised
+- unresolved questions or threads they intend to come back to
+- corrections they gave the assistant
 
 Drop:
 - conversational filler and pleasantries

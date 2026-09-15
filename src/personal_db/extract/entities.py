@@ -13,7 +13,7 @@ from ._text import windows
 
 log = logging.getLogger(__name__)
 
-# Personal-ontology labels — what we want to recognize in Alex's corpus.
+# Personal-ontology labels — what we want to recognize in the user's corpus.
 LABELS = [
     "person",
     "organization",
