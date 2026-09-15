@@ -14,8 +14,3 @@ wheels/
 
 # Local data (vector + graph stores, raw uploads, session DB)
 data/
-
-# Design docs for a different (work) project that ended up in this folder —
-# Helix's customer-support portal. Never commit these here.
-voice-agent-portal-integration.md
-updated-plan.md
