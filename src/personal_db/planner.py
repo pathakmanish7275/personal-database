@@ -29,7 +29,7 @@ from .llm_runtime import safe_chat
 
 log = logging.getLogger(__name__)
 
-PLANNER_SYSTEM = """You plan the first step of a personal-knowledge-base agent that retrieves from Alex's notes and a knowledge graph.
+PLANNER_SYSTEM = """You plan the first step of a personal-knowledge-base agent that retrieves from the user's notes and a knowledge graph.
 
 For the next user message, decide ONE of:
 - "search":  the question is specific enough to retrieve on. Restate it as a precise, keyword-rich query — short, no pronouns, no filler.
