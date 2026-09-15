@@ -18,7 +18,8 @@ def _patch_primary(monkeypatch, llm):
 
 def test_safe_chat_returns_primary_on_success(monkeypatch):
     from personal_db import config as cfg, llm_runtime as lr
-    monkeypatch.setattr(cfg.config, "llm_provider", "gemini")
+    monkeypatch.setattr(cfg.config, "llm_host", "http://flm")
+    monkeypatch.setattr(cfg.config, "fallback_llm_host", "http://ollama")
     _reset_fallback()
     primary = MagicMock()
     primary.chat.return_value = "OK_PRIMARY"
@@ -27,9 +28,10 @@ def test_safe_chat_returns_primary_on_success(monkeypatch):
     primary.chat.assert_called_once()
 
 
-def test_safe_chat_falls_back_when_primary_raises_and_gemini_enabled(monkeypatch):
+def test_safe_chat_falls_back_when_primary_raises(monkeypatch):
     from personal_db import config as cfg, llm_runtime as lr
-    monkeypatch.setattr(cfg.config, "llm_provider", "gemini")
+    monkeypatch.setattr(cfg.config, "llm_host", "http://flm")
+    monkeypatch.setattr(cfg.config, "fallback_llm_host", "http://ollama")
     _reset_fallback()
     primary = MagicMock()
     primary.chat.side_effect = RuntimeError("API down")
@@ -47,7 +49,6 @@ def test_safe_chat_does_not_fall_back_when_primary_and_fallback_share_host(monke
     """provider=ollama with chat LLM on the same host as the fallback: nothing
     to fall back to, so the error propagates."""
     from personal_db import config as cfg, llm_runtime as lr
-    monkeypatch.setattr(cfg.config, "llm_provider", "ollama")
     monkeypatch.setattr(cfg.config, "llm_host", "http://localhost:11434")
     monkeypatch.setattr(cfg.config, "fallback_llm_host", "http://localhost:11434")
     _reset_fallback()
@@ -65,10 +66,8 @@ def test_safe_chat_does_not_fall_back_when_primary_and_fallback_share_host(monke
 
 
 def test_safe_chat_falls_back_to_local_ollama_when_flm_primary_down(monkeypatch):
-    """provider=ollama with the chat LLM on a separate server (FLM): if the
-    primary server dies, fall back to local Ollama."""
+    """Chat model on its own server (FLM): if it dies, fall back to Ollama."""
     from personal_db import config as cfg, llm_runtime as lr
-    monkeypatch.setattr(cfg.config, "llm_provider", "ollama")
     monkeypatch.setattr(cfg.config, "llm_host", "http://localhost:52625")
     monkeypatch.setattr(cfg.config, "fallback_llm_host", "http://localhost:11434")
     _reset_fallback()
@@ -85,8 +84,13 @@ def test_safe_chat_falls_back_to_local_ollama_when_flm_primary_down(monkeypatch)
 
 
 def test_safe_stream_chat_peeks_first_chunk_and_yields_rest(monkeypatch):
+    # Real streaming, not the emulated path: streaming is only emulated when the
+    # chat model is on its own server (FLM), so keep llm_host == ollama_host and
+    # put the fallback elsewhere so a fallback still exists.
     from personal_db import config as cfg, llm_runtime as lr
-    monkeypatch.setattr(cfg.config, "llm_provider", "gemini")
+    monkeypatch.setattr(cfg.config, "ollama_host", "http://localhost:11434")
+    monkeypatch.setattr(cfg.config, "llm_host", "http://localhost:11434")
+    monkeypatch.setattr(cfg.config, "fallback_llm_host", "http://elsewhere")
     _reset_fallback()
 
     primary = MagicMock()
@@ -98,8 +102,13 @@ def test_safe_stream_chat_peeks_first_chunk_and_yields_rest(monkeypatch):
 
 
 def test_safe_stream_chat_falls_back_when_primary_errors_at_first_chunk(monkeypatch):
+    # Real streaming, not the emulated path: streaming is only emulated when the
+    # chat model is on its own server (FLM), so keep llm_host == ollama_host and
+    # put the fallback elsewhere so a fallback still exists.
     from personal_db import config as cfg, llm_runtime as lr
-    monkeypatch.setattr(cfg.config, "llm_provider", "gemini")
+    monkeypatch.setattr(cfg.config, "ollama_host", "http://localhost:11434")
+    monkeypatch.setattr(cfg.config, "llm_host", "http://localhost:11434")
+    monkeypatch.setattr(cfg.config, "fallback_llm_host", "http://elsewhere")
     _reset_fallback()
 
     def boom():
@@ -183,7 +192,6 @@ def test_safe_chat_falls_back_when_primary_returns_only_reasoning(monkeypatch):
     failed turn and retry once on the fallback."""
     from personal_db import config as cfg, llm_runtime as lr
     from llama_index.core.llms import ChatMessage, ChatResponse, MessageRole
-    monkeypatch.setattr(cfg.config, "llm_provider", "ollama")
     monkeypatch.setattr(cfg.config, "llm_host", "http://localhost:52625")
     monkeypatch.setattr(cfg.config, "fallback_llm_host", "http://localhost:11434")
     _reset_fallback()
@@ -212,7 +220,6 @@ def test_safe_chat_keeps_primary_answer_when_extraction_succeeds(monkeypatch):
     """A normal reasoning+answer reply must NOT trigger the fallback."""
     from personal_db import config as cfg, llm_runtime as lr
     from llama_index.core.llms import ChatMessage, ChatResponse, MessageRole
-    monkeypatch.setattr(cfg.config, "llm_provider", "ollama")
     monkeypatch.setattr(cfg.config, "llm_host", "http://localhost:52625")
     monkeypatch.setattr(cfg.config, "fallback_llm_host", "http://localhost:11434")
     _reset_fallback()

@@ -37,9 +37,8 @@ def _path(env_key: str, default: str) -> Path:
 
 
 class Config(BaseModel):
-    # LLM provider: "ollama" (local) or "gemini" / "openai" / "anthropic" (cloud).
-    # Embeddings stay local via Ollama regardless of provider.
-    llm_provider: str = Field(default_factory=lambda: os.getenv("LLM_PROVIDER", "ollama").lower())
+    # Everything runs locally: chat on `llm_host` (FLM/NPU or Ollama),
+    # embeddings always on `ollama_host`. There is no cloud provider.
     ollama_host: str = Field(default_factory=lambda: os.getenv("OLLAMA_HOST", "http://localhost:11434"))
     # Host for the chat LLM only (Ollama-compatible API, e.g. FLM on its own
     # port). Defaults to ollama_host; embeddings always use ollama_host.
@@ -125,38 +124,6 @@ class Config(BaseModel):
             "Picking up where we left off. What would you like to know?",
         )
     )
-
-    @model_validator(mode="after")
-    def _resolve_thinking(self) -> "Config":
-        raw = os.getenv("LLM_THINKING", "auto").lower()
-        if raw == "auto":
-            # Only touch the think param for models that actually support it.
-            # For everything else (gpt-oss, llama, mistral, gemma…) leave None
-            # so Ollama never sees the flag.
-            _thinking_families = ("qwen3", "qwq", "deepseek-r1")
-            is_thinking_model = any(f in self.llm_model.lower() for f in _thinking_families)
-            if is_thinking_model:
-                # 2b variant loses tool-use when thinking is fully off — omit the flag.
-                self.llm_thinking = None if ":2b" in self.llm_model else False
-        elif raw in ("true", "1", "yes"):
-            self.llm_thinking = True
-        elif raw in ("false", "0", "no"):
-            self.llm_thinking = False
-        # else: leave as None (omit the param entirely)
-        return self
-
-    # Gemini (free tier covers gemini-2.5-flash and gemini-2.5-flash-lite).
-    gemini_model: str = Field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"))
-    gemini_api_key: str = Field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
-
-    # OpenAI (any model on your account; gpt-4o-mini is the cheap/fast tier).
-    openai_model: str = Field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
-    openai_api_key: str = Field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
-
-    # Anthropic (claude-3-5-haiku-20241022 is the fast/cheap tier).
-    anthropic_model: str = Field(default_factory=lambda: os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022"))
-    anthropic_api_key: str = Field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""))
-
     data_dir: Path = Field(default_factory=lambda: _path("DATA_DIR", "./data"))
     qdrant_path: Path = Field(default_factory=lambda: _path("QDRANT_PATH", "./data/qdrant"))
     kuzu_path: Path = Field(default_factory=lambda: _path("KUZU_PATH", "./data/kuzu/personal.db"))
@@ -191,5 +158,23 @@ class Config(BaseModel):
         self.kuzu_path.parent.mkdir(parents=True, exist_ok=True)
         self.raw_dir.mkdir(parents=True, exist_ok=True)
 
+    @model_validator(mode="after")
+    def _resolve_thinking(self) -> "Config":
+        raw = os.getenv("LLM_THINKING", "auto").lower()
+        if raw == "auto":
+            # Only touch the think param for models that actually support it.
+            # For everything else (gpt-oss, llama, mistral, gemma…) leave None
+            # so Ollama never sees the flag.
+            _thinking_families = ("qwen3", "qwq", "deepseek-r1")
+            is_thinking_model = any(f in self.llm_model.lower() for f in _thinking_families)
+            if is_thinking_model:
+                # 2b variant loses tool-use when thinking is fully off — omit the flag.
+                self.llm_thinking = None if ":2b" in self.llm_model else False
+        elif raw in ("true", "1", "yes"):
+            self.llm_thinking = True
+        elif raw in ("false", "0", "no"):
+            self.llm_thinking = False
+        # else: leave as None (omit the param entirely)
+        return self
 
 config = Config()

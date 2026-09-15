@@ -37,57 +37,15 @@ def _ollama_llm() -> Ollama:
 
 
 def configure_llama_index() -> None:
-    """Point LlamaIndex Settings at the configured LLM provider.
+    """Point LlamaIndex Settings at the local models.
 
-    LLM is swappable (ollama | gemini). When provider=gemini fails *at
-    construction* (bad key, no network at startup), we silently fall through
-    to Ollama so the assistant still works. Run-time failures on a successfully
-    constructed Gemini are handled per-call by llm_runtime.safe_*.
+    Chat goes to `llm_host` — FLM on the NPU when configured, otherwise the
+    local Ollama. Embeddings always go to `ollama_host`: FLM serves one model
+    at a time, and a query embedding is milliseconds on CPU anyway.
 
-    Embeddings always stay local via Ollama — cheap on CPU and keeps the
-    corpus private."""
-    provider = (config.llm_provider or "ollama").lower()
-    llm = None
-    if provider == "gemini" and config.gemini_api_key:
-        try:
-            from llama_index.llms.google_genai import GoogleGenAI
-
-            llm = GoogleGenAI(
-                model=config.gemini_model,
-                api_key=config.gemini_api_key,
-                context_window=131072,
-            )
-        except Exception as e:  # noqa: BLE001
-            log.warning(
-                "Gemini LLM init failed (%s); falling back to Ollama for this session", e
-            )
-            llm = None
-    elif provider == "gemini":
-        log.warning("LLM_PROVIDER=gemini but GEMINI_API_KEY is empty; using Ollama")
-    elif provider == "openai" and config.openai_api_key:
-        try:
-            from llama_index.llms.openai import OpenAI
-
-            llm = OpenAI(model=config.openai_model, api_key=config.openai_api_key)
-        except Exception as e:  # noqa: BLE001
-            log.warning("OpenAI LLM init failed (%s); falling back to Ollama for this session", e)
-            llm = None
-    elif provider == "openai":
-        log.warning("LLM_PROVIDER=openai but OPENAI_API_KEY is empty; using Ollama")
-    elif provider == "anthropic" and config.anthropic_api_key:
-        try:
-            from llama_index.llms.anthropic import Anthropic
-
-            llm = Anthropic(model=config.anthropic_model, api_key=config.anthropic_api_key)
-        except Exception as e:  # noqa: BLE001
-            log.warning(
-                "Anthropic LLM init failed (%s); falling back to Ollama for this session", e
-            )
-            llm = None
-    elif provider == "anthropic":
-        log.warning("LLM_PROVIDER=anthropic but ANTHROPIC_API_KEY is empty; using Ollama")
-
-    Settings.llm = llm or _ollama_llm()
+    There is no cloud provider branch. Everything runs on this machine, which
+    is the point of the project; a remote fallback would quietly undo it."""
+    Settings.llm = _ollama_llm()
     Settings.embed_model = OllamaEmbedding(
         model_name=config.embed_model,
         base_url=config.ollama_host,

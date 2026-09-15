@@ -1,6 +1,6 @@
 # Personal Database
 
-A fully-local, privacy-first AI assistant that answers questions from **your own corpus** — notes, journals, PDFs, books, papers. Combines semantic vector search with a knowledge graph built from your documents, and streams answers using any LLM provider you choose.
+A fully-local, privacy-first AI assistant that answers questions from **your own corpus** — notes, journals, PDFs, books, papers. Combines semantic vector search with a knowledge graph built from your documents, and answers by voice or text — all on local models.
 
 Everything runs on your machine. Your data never leaves.
 
@@ -13,7 +13,7 @@ Everything runs on your machine. Your data never leaves.
 - **Hybrid retrieval**: every query fires a semantic vector search and a graph traversal simultaneously. Results are fused via Reciprocal Rank Fusion (RRF) before the LLM ever sees them.
 - **Agentic retrieval**: the knowledge base is exposed to the model as a *tool*, not a fixed pipeline stage. The model decides whether to search at all, writes its own query, may search again with better terms, or asks a clarifying question — so greetings and general-knowledge questions skip retrieval entirely instead of paying for it.
 - **Knowledge graph**: entities (people, projects, tools, concepts, decisions…) and relations are extracted automatically from every ingested document using GLiNER (NER) and REBEL (relation extraction) — no LLM needed for extraction.
-- **Provider flexibility**: use a local Ollama model by default. Switch to Gemini, OpenAI, or Anthropic with a single env var, with automatic fallback to local Ollama on API outage.
+- **Runs entirely on your machine**: chat on an AMD NPU via [FastFlowLM](https://github.com/ROCm/FastFlowLM) when available, otherwise Ollama; embeddings, speech-to-text and text-to-speech all local. No API keys, no cloud provider, nothing leaves the device.
 - **Voice and text, one assistant**: press Call on the chat page and talk. A spoken turn runs the *same* agent, searches the *same* knowledge base, and lands in the *same* conversation thread — so you can ask by voice and follow up by typing. Speech-to-text and text-to-speech are local; nothing leaves the machine.
 - **Memory compaction**: long conversations are summarized automatically so context stays coherent without ballooning token counts.
 
@@ -56,7 +56,6 @@ FastAPI + Jinja2 web UI  (localhost:8765)
                                      │              or searches once more (capped)
                                      └── persist message + accumulated citations → SQLite
 
-
 Stores (all embedded, zero ops):
   Qdrant   ./data/qdrant/          vector index
   Kuzu     ./data/kuzu/personal.db knowledge graph
@@ -68,7 +67,8 @@ Stores (all embedded, zero ops):
 ## Requirements
 
 - **Python 3.11** (3.12 works; 3.13+ not yet supported by all ML deps)
-- **[Ollama](https://ollama.com)** running locally — used for embeddings regardless of which LLM provider you choose
+- **[Ollama](https://ollama.com)** running locally — always serves embeddings, and serves chat unless `LLM_HOST` points elsewhere
+- *(optional)* **[FastFlowLM](https://github.com/ROCm/FastFlowLM)** to run chat on an AMD Ryzen AI NPU. Without it everything still works on Ollama
 - **[uv](https://docs.astral.sh/uv/)** for dependency management
 - 8 GB RAM minimum; 16 GB recommended. The default chat model is a 4B; larger models need proportionally more
 
@@ -78,7 +78,7 @@ Stores (all embedded, zero ops):
 
 ```bash
 # 1. Clone
-git clone https://github.com/<your-handle>/personal-database.git
+git clone https://github.com/pathakmanish7275/personal-database.git
 cd personal-database
 
 # 2. Install deps
@@ -90,7 +90,7 @@ ollama pull qwen3.5:4b           # chat model — must support tool calling
 
 # 4. Configure
 cp .env.example .env
-# Edit .env — at minimum set LLM_PROVIDER and any required API keys
+# Edit .env — defaults work; set LLM_HOST if you run FLM on the NPU
 
 # 5. Run
 ./run.sh
@@ -103,105 +103,13 @@ cp .env.example .env
 
 Copy `.env.example` to `.env` and edit. All values have sensible defaults.
 
-### LLM Provider
-
-Set `LLM_PROVIDER` to one of: `ollama`, `gemini`, `openai`, `anthropic`.
-
-If the chosen provider fails at startup (missing key, network issue), the system falls back to local Ollama automatically.
-
-**Embeddings always stay local** via Ollama regardless of which LLM provider is active. This keeps your corpus private and avoids per-token embedding costs.
-
----
-
-#### Ollama (default — fully local)
-
-```env
-LLM_PROVIDER=ollama
-OLLAMA_HOST=http://localhost:11434
-LLM_MODEL=qwen3.5:4b          # must support tool calling
-EMBED_MODEL=nomic-embed-text
-```
-
-`LLM_MODEL` accepts any model name you have pulled via `ollama pull`. Examples:
-
-| Hardware | Suggested model |
-|---|---|
-| 8 GB RAM, low power | `llama3.2:3b`, `phi3:mini`, `qwen2.5:3b` |
-| 16 GB RAM, mid-range | `llama3.1:8b`, `mistral:7b`, `gemma2:9b` |
-| 32 GB+ RAM, high-end | `gpt-oss:20b`, `llama3.3:70b`, `qwq:32b` |
-
----
-
-#### Gemini (Google — free tier available)
-
-The free tier covers `gemini-2.5-flash` and `gemini-2.5-flash-lite`.
-
-```env
-LLM_PROVIDER=gemini
-GEMINI_MODEL=gemini-2.5-flash-lite
-GEMINI_API_KEY=your_key_here
-```
-
-Get a key at [aistudio.google.com](https://aistudio.google.com).
-
----
-
-#### OpenAI
-
-```env
-LLM_PROVIDER=openai
-OPENAI_MODEL=gpt-4o-mini
-OPENAI_API_KEY=your_key_here
-```
-
-Any model on your OpenAI account works — `gpt-4o`, `gpt-4o-mini`, `o3-mini`, etc.
-
----
-
-#### Anthropic
-
-```env
-LLM_PROVIDER=anthropic
-ANTHROPIC_MODEL=claude-3-5-haiku-20241022
-ANTHROPIC_API_KEY=your_key_here
-```
-
-Any model on your Anthropic account works — `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5`, etc.
-
----
-
-### Adding your own provider
-
-The provider switch lives in `src/personal_db/stores.py → configure_llama_index()`. The pattern is:
-
-```python
-elif provider == "myprovider" and config.myprovider_api_key:
-    try:
-        from llama_index.llms.myprovider import MyProvider
-        llm = MyProvider(model=config.myprovider_model, api_key=config.myprovider_api_key)
-    except Exception as e:
-        log.warning("MyProvider init failed (%s); falling back to Ollama", e)
-        llm = None
-```
-
-Add the corresponding config fields to `config.py` and the LlamaIndex integration package to `pyproject.toml`. Any LlamaIndex-compatible LLM works.
-
----
-
 ### Full configuration reference
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_PROVIDER` | `ollama` | Active LLM provider |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama API base URL |
 | `LLM_MODEL` | `qwen3.5:4b` | Chat model — must support tool calling |
 | `EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model |
-| `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Gemini model name |
-| `GEMINI_API_KEY` | _(empty)_ | Gemini API key |
-| `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI model name |
-| `OPENAI_API_KEY` | _(empty)_ | OpenAI API key |
-| `ANTHROPIC_MODEL` | `claude-3-5-haiku-20241022` | Anthropic model name |
-| `ANTHROPIC_API_KEY` | _(empty)_ | Anthropic API key |
 | `DATA_DIR` | `./data` | Root for all local stores |
 | `QDRANT_PATH` | `./data/qdrant` | Qdrant embedded store path |
 | `KUZU_PATH` | `./data/kuzu/personal.db` | Kuzu graph DB path |
@@ -399,6 +307,21 @@ src/personal_db/
 - [ ] Export/import corpus snapshots
 
 ---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+---
+
+## Acknowledgements
+
+NPU inference is powered by **[FastFlowLM](https://github.com/ROCm/FastFlowLM)** (MIT).
+Speech-to-text uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper);
+text-to-speech uses [Kokoro](https://github.com/hexgrad/kokoro); the voice pipeline
+is built on [Pipecat](https://github.com/pipecat-ai/pipecat). Entity and relation
+extraction use [GLiNER](https://github.com/urchade/GLiNER) and
+[REBEL](https://github.com/Babelscape/rebel).
 
 ## License
 

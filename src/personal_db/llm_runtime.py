@@ -10,12 +10,12 @@ Two invariants live here:
    server's own queue (FLM: "NPU busy, request queued") therefore stays
    empty — waiting happens in our system, never on the NPU server.
 
-2. **Fallback.** When the configured primary LLM (e.g. Gemini Flash) is up,
+2. **Fallback.** When the configured primary LLM (FLM on the NPU) is up,
    all chat / stream calls go through it. If the primary raises (network
    error, API outage, rate limit, parse error), we transparently fall back
    to the local Ollama model so the assistant keeps answering. Fallback only
-   kicks in when the primary is remote (gemini, or ollama on a separate
-   host); there's nothing to fall back to when primary == fallback host.
+   kicks in when the chat model is on its own server (FLM on the NPU);
+   there's nothing to fall back to when primary == fallback host.
 
 Mid-stream failures (an exception thrown after some tokens have already been
 yielded) cannot be safely recovered without re-issuing the prompt and replaying
@@ -191,15 +191,13 @@ def _get_fallback() -> Ollama:
 
 
 def _fallback_enabled() -> bool:
-    provider = (config.llm_provider or "ollama").lower()
-    if provider == "gemini":
-        return True
-    # provider=ollama with the chat LLM on a separate server (e.g. FLM):
-    # fall back to the local Ollama host if the primary server is down.
-    return (
-        provider == "ollama"
-        and config.llm_host.rstrip("/") != config.fallback_llm_host.rstrip("/")
-    )
+    """True when there is somewhere else to send the request.
+
+    Purely a question of hosts now: if the chat model lives on its own server
+    (FLM on the NPU) and the fallback lives elsewhere (local Ollama), a dead
+    primary can be routed around. When both point at the same host there is
+    nothing to fall back to."""
+    return config.llm_host.rstrip("/") != config.fallback_llm_host.rstrip("/")
 
 
 def _primary_chat_with_recovery(messages):
@@ -260,11 +258,7 @@ def _primary_stream_is_unsafe() -> bool:
     'Creating checkpoint' — process alive, API dead. Sync chat on the same
     server is stable, so for FLM primaries we emulate streaming with sync
     calls instead of taking the NPU server down mid-conversation."""
-    provider = (config.llm_provider or "ollama").lower()
-    return (
-        provider == "ollama"
-        and config.llm_host.rstrip("/") != config.ollama_host.rstrip("/")
-    )
+    return config.llm_host.rstrip("/") != config.ollama_host.rstrip("/")
 
 
 def _safe_stream(messages) -> Iterable:
