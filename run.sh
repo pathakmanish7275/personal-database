@@ -43,6 +43,19 @@ if ! command -v ollama >/dev/null 2>&1; then
   exit 1
 fi
 
+# ── port preflight ───────────────────────────────────────────────────────────
+# Check the web port first. uvicorn only discovers a clash when it binds, which
+# is *after* this script has started FLM and the audio servers — so a collision
+# used to leave three model servers running with no app attached.
+PORT="${PORT:-8765}"
+if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${PORT}$"; then
+  holder="$(ss -ltnp 2>/dev/null | grep -E "[:.]${PORT} " | sed -n 's/.*(("\([^"]*\)",pid=\([0-9]*\).*/\1 (pid \2)/p' | head -1)"
+  echo "ERROR: port ${PORT} is already in use${holder:+ by ${holder}}." >&2
+  echo "       Nothing was started. Either stop that process, or pick another" >&2
+  echo "       port:  PORT=8770 ./run.sh   (or set PORT= in .env)" >&2
+  exit 1
+fi
+
 # Start ollama serve if its API isn't reachable.
 OLLAMA_URL="${OLLAMA_HOST:-http://localhost:11434}"
 if ! curl -sf "${OLLAMA_URL}/api/tags" >/dev/null 2>&1; then
@@ -132,7 +145,6 @@ fi
 
 mkdir -p ./data/raw ./data/qdrant ./data/kuzu
 
-PORT="${PORT:-8765}"
 URL="http://localhost:${PORT}"
 
 # Open browser shortly after server starts (best-effort).
