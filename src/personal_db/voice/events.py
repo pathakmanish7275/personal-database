@@ -85,8 +85,39 @@ def make_state_observer(session_id: str):
     from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
     class _VoiceStateObserver(FrameProcessor):
+        _audio_frames = 0
+        _peak_volume = 0.0
+        _saw_speech = False
+
         async def process_frame(self, frame: Frame, direction: FrameDirection):
             await super().process_frame(frame, direction)
+            # "Connects, greets, then ignores you" is this pipeline's worst
+            # failure: nothing errors, so the logs look healthy. It happened
+            # because VAD needs BOTH confidence and volume, and a quiet mic
+            # fails the volume gate silently. Say so out loud rather than
+            # leaving the next person to instrument it again.
+            name = type(frame).__name__
+            if name in ("VADUserStartedSpeakingFrame", "UserStartedSpeakingFrame"):
+                self._saw_speech = True
+            elif name == "InputAudioRawFrame":
+                self._audio_frames += 1
+                try:
+                    from pipecat.audio.utils import calculate_audio_volume
+                    self._peak_volume = max(
+                        self._peak_volume,
+                        calculate_audio_volume(frame.audio, getattr(frame, "sample_rate", 16000)),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                # ~15s of audio at 20ms/frame with VAD never once firing.
+                if self._audio_frames == 750 and not self._saw_speech:
+                    log.warning(
+                        "voice: %d audio frames received but VAD never detected speech; "
+                        "peak volume %.3f. If that is below VADParams.min_volume the "
+                        "volume gate cannot open and nothing will ever be transcribed.",
+                        self._audio_frames, self._peak_volume,
+                    )
+
             if isinstance(frame, UserStartedSpeakingFrame):
                 publish(session_id, "hearing")
             elif isinstance(frame, UserStoppedSpeakingFrame):
