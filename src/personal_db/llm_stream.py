@@ -16,8 +16,12 @@ Wire behaviour this module relies on, all measured rather than assumed:
 * Content emitted *before* a tool call is whitespace only.
 * ``finish_reason`` is ``tool_calls`` when the model wants a tool, ``stop``
   when it has answered, and ``length`` when it ran out of output budget.
-* Do **not** send ``reasoning_effort``: on FLM it yields ``finish_reason:
-  length`` with zero content.
+* ``reasoning_effort`` has **no effect** on FLM server mode. Neither
+  ``reasoning_effort``, ``options.reasoning_effort`` nor a ``Reasoning: low``
+  system line changes gpt-oss's reasoning length by more than the run-to-run
+  noise (measured n=3: 33-136s spread *within* one condition). FLM documents
+  ``/set r-eff`` for CLI mode only, and v1.0.6 does not add a server-mode
+  equivalent. Reasoning cost on gpt-oss is therefore fixed.
 
 Tool-call deltas are accumulated by index in the standard OpenAI way. FLM
 happens to send each call complete in a single delta, but Ollama may fragment
@@ -28,8 +32,10 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Iterator, Literal
+from urllib.parse import urlparse
 
 import httpx
 
@@ -102,6 +108,12 @@ def _reasoning_of(delta: dict) -> str | None:
     return None
 
 
+def _is_local(base_url: str) -> bool:
+    """Whether `base_url` points at a server sharing this machine's accelerator."""
+    host = urlparse(base_url).hostname or ""
+    return host in ("localhost", "127.0.0.1", "::1", "0.0.0.0")
+
+
 def stream_chat(
     messages: list[dict],
     *,
@@ -111,6 +123,9 @@ def stream_chat(
     think: bool | None = None,
     max_tokens: int | None = None,
     timeout: float = 600.0,
+    api_key: str | None = None,
+    extra_body: dict | None = None,
+    serialize: bool | None = None,
 ) -> Iterator[StreamEvent]:
     """Stream one chat completion, yielding events as they arrive.
 
@@ -118,6 +133,12 @@ def stream_chat(
     completions" is appended. The final event is always kind="done" and carries
     `finish_reason` plus `usage`, even when the stream ends without either —
     callers can rely on seeing exactly one terminal event.
+
+    `serialize` controls the process-wide call gate, which exists to keep two
+    requests off the NPU at once. It defaults to whether `base_url` is local:
+    a remote endpoint has its own capacity, so holding the gate for it would
+    both serialise calls that could run concurrently and block local chat for
+    the duration. Pass it explicitly to override.
     """
     payload: dict = {"model": model, "stream": True, "messages": messages}
     if tools:
@@ -131,15 +152,22 @@ def stream_chat(
         # question, all of it inside the reasoning channel.
         payload["max_tokens"] = max_tokens
 
+    if extra_body:
+        payload.update(extra_body)
+
     url = base_url.rstrip("/") + "/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    if serialize is None:
+        serialize = _is_local(base_url)
     acc = _ToolCallAccumulator()
     finish_reason: str | None = None
     usage: dict | None = None
 
     # Held for the whole request, so this client and the LlamaIndex path share
-    # one guarantee: never two requests in flight to the NPU at once.
-    with call_gate():
-        with httpx.Client(timeout=timeout) as client:
+    # one guarantee: never two requests in flight to the NPU at once. A remote
+    # endpoint is exempt — see `serialize`.
+    with (call_gate() if serialize else nullcontext()):
+        with httpx.Client(timeout=timeout, headers=headers) as client:
             with client.stream("POST", url, json=payload) as resp:
                 resp.raise_for_status()
                 for line in resp.iter_lines():
