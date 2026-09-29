@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -270,6 +271,40 @@ def graph_backfill_targets(stores: Stores) -> list[Path]:
     return targets
 
 
+def _stable_doc_id(payload: dict, meta: dict) -> str | None:
+    """The content-hash identity of the document a chunk belongs to.
+
+    Must never fall back to LlamaIndex's `ref_doc_id` before trying the
+    embedded metadata. `ref_doc_id` is a *fresh UUID per ingest run*, so a
+    corpus keyed by it never matches the content hash `ingest_one` computes —
+    the dedup gate fails open and every ingest re-embeds everything. That is
+    how this corpus came to hold four copies of itself (3283 points for 826
+    distinct chunks).
+
+    Points written before the `pdb_doc_id` rename carry the content hash as a
+    plain `doc_id` inside `_node_content.metadata`, where LlamaIndex's own
+    top-level `doc_id` does not shadow it.
+    """
+    for key in ("pdb_doc_id",):
+        if meta.get(key):
+            return meta[key]
+        if payload.get(key):
+            return payload[key]
+
+    raw = payload.get("_node_content")
+    if raw:
+        try:
+            node_meta = (json.loads(raw).get("metadata") or {})
+        except (json.JSONDecodeError, TypeError):
+            node_meta = {}
+        for key in ("pdb_doc_id", "doc_id"):
+            if node_meta.get(key):
+                return node_meta[key]
+
+    # Last resort, and only so a legacy corpus still lists at all.
+    return meta.get("ref_doc_id") or payload.get("ref_doc_id")
+
+
 def list_documents(stores: Stores | None = None) -> list[dict]:
     """Pull a deduplicated list of ingested documents from Qdrant payloads."""
     if stores is None:
@@ -295,14 +330,7 @@ def list_documents(stores: Stores | None = None) -> list[dict]:
         for p in points:
             payload = p.payload or {}
             meta = payload.get("metadata") or payload
-            # Prefer our namespaced key; fall back to LlamaIndex's parent-doc
-            # UUID so corpora ingested before the rename still show up.
-            doc_id = (
-                meta.get("pdb_doc_id")
-                or payload.get("pdb_doc_id")
-                or meta.get("ref_doc_id")
-                or payload.get("ref_doc_id")
-            )
+            doc_id = _stable_doc_id(payload, meta)
             if not doc_id:
                 continue
             entry = seen.setdefault(
