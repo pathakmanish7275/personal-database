@@ -108,6 +108,27 @@ async def voice_events(session_id: str):
     return EventSourceResponse(gen())
 
 
+@router.post("/{session_id}/say")
+async def voice_say(session_id: str, request: Request):
+    """Send typed text into a call that is already running.
+
+    Speech is the lossy channel: names and spellings arrive mangled ("MuseTalk"
+    came through as "new stock" and "MUSP C-A-L-T"), and repeating them louder
+    does not help. Typing gives the caller an exact-input path without dropping
+    the call, and the reply still comes back as speech.
+    """
+    body = await request.json()
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="empty text")
+
+    from .bot import say_text
+
+    if not await say_text(session_id, text):
+        raise HTTPException(status_code=409, detail="no call is running")
+    return {"ok": True}
+
+
 @router.post("/offer")
 async def voice_offer(request: Request):
     """WebRTC offer/answer. Body carries the offer plus `session_id`."""

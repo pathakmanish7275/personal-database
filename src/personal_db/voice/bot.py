@@ -18,10 +18,11 @@ import logging
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import TTSSpeakFrame
+from pipecat.frames.frames import LLMMessagesAppendFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
@@ -57,6 +58,36 @@ def _greeting_for(session_id: str) -> str:
     return config.voice_resume_greeting
 
 
+# Live pipeline tasks by session, so a typed message can be injected into a
+# call that is already running. A call is an asyncio task inside this process;
+# without a handle on it the only way in is the microphone.
+_live_tasks: dict[str, "PipelineTask"] = {}
+
+
+async def say_text(session_id: str, text: str) -> bool:
+    """Feed typed text into a live call as if the caller had spoken it.
+
+    Returns False when no call is running for that session.
+
+    Uses LLMMessagesAppendFrame(run_llm=True) rather than a synthetic
+    transcription: the aggregator appends it to the same context the spoken
+    turns build, so the reply is spoken, persisted to the chat thread and
+    carried in history identically. Typing is the reliable path for anything
+    STT mangles — names, spellings, identifiers.
+    """
+    task = _live_tasks.get(session_id)
+    if task is None:
+        return False
+    await task.queue_frames(
+        [
+            LLMMessagesAppendFrame(
+                messages=[{"role": "user", "content": text}], run_llm=True
+            )
+        ]
+    )
+    return True
+
+
 async def run_voice_bot(webrtc_connection, *, stores: Stores, session_id: str) -> None:
     """Drive one voice call for one chat session."""
     # Retrieval runs through LlamaIndex, whose global Settings must be pointed
@@ -77,24 +108,51 @@ async def run_voice_bot(webrtc_connection, *, stores: Stores, session_id: str) -
         ),
     )
 
-    # NB: the VAD goes on the user aggregator, not on TransportParams —
-    # TransportParams has no `vad_analyzer` field in pipecat 1.3.0 and silently
-    # ignores the kwarg, which leaves speech unsegmented and STT receiving
-    # nothing at all (the failure looks like "it can't hear me").
-    vad = SileroVADAnalyzer(params=VADParams(stop_secs=0.6))
+    # VAD must run as its own processor placed BEFORE the STT service.
+    #
+    # `OpenAISTTService` is a SegmentedSTTService: it buffers audio and only
+    # transcribes when it receives VADUserStoppedSpeakingFrame. Those frames
+    # come from VADProcessor. Configuring the analyzer on the user aggregator
+    # instead puts the VAD *downstream* of STT, where its frames can never
+    # reach it — the call connects, the greeting plays, and then nothing
+    # happens no matter how long you talk.
+    #
+    # `TransportParams` has no `vad_analyzer` field in pipecat 1.3.0, so the
+    # transport cannot carry it either; VADProcessor is the supported place.
+    # min_volume is lowered from pipecat's default 0.6 because VAD requires
+    # BOTH `confidence >= 0.7` AND `volume >= min_volume`, and this machine's
+    # mic — through the browser's echo cancellation and AGC — peaks at 0.286
+    # on normal speech (measured). At the default the volume gate can never
+    # open, so no VADUserStoppedSpeakingFrame is ever emitted and the segmented
+    # STT never transcribes: the call connects, greets, and then ignores you
+    # forever. Silero's confidence stays the real speech test; this is only a
+    # noise floor, and 0.1 sits well above the ~0.04 measured when quiet.
+    # stop_secs is the silence needed to end a turn. At 0.6 an ordinary pause —
+    # thinking mid-sentence, or spelling a name out letter by letter — ends the
+    # turn early, and each fragment is sent to the agent as a separate question.
+    # Measured on one call: "look into my database and find anything about
+    # MuseTalk" arrived as three turns ("...find anything about new stock." /
+    # "Files MUSP" / "C-A-L-T."), so the agent was answering fragments and
+    # looked like it could not understand. 1.2s spans a normal pause.
+    vad = SileroVADAnalyzer(params=VADParams(stop_secs=1.2, min_volume=0.1))
 
     llm = PersonalDBLLMService(stores=stores, session_id=session_id)
 
     # No `tools` on the context: tool calling happens *inside* the agent, one
     # layer down. Pipecat only needs to carry the conversation.
     context = LLMContext(messages=[{"role": "system", "content": VOICE_SYSTEM_PROMPT}])
+    # No `vad_analyzer` here on purpose: the aggregator would build a second,
+    # independent VADController over the same audio, doubling Silero's cost and
+    # letting two controllers disagree about turn boundaries. Its turn
+    # strategies consume the VAD frames VADProcessor already emits upstream.
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-        context, user_params=LLMUserAggregatorParams(vad_analyzer=vad)
+        context, user_params=LLMUserAggregatorParams()
     )
 
     pipeline = Pipeline(
         [
             transport.input(),
+            VADProcessor(vad_analyzer=vad),
             vevents.make_state_observer(session_id),
             create_stt(),
             user_aggregator,
@@ -127,4 +185,11 @@ async def run_voice_bot(webrtc_connection, *, stores: Stores, session_id: str) -
 
     from pipecat.pipeline.runner import PipelineRunner
 
-    await PipelineRunner(handle_sigint=False).run(task)
+    _live_tasks[session_id] = task
+    try:
+        await PipelineRunner(handle_sigint=False).run(task)
+    finally:
+        # Must not outlive the call: a stale task would accept typed messages
+        # into a pipeline that is already torn down.
+        if _live_tasks.get(session_id) is task:
+            _live_tasks.pop(session_id, None)
