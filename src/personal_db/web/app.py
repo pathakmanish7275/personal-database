@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import time
@@ -38,6 +39,17 @@ from .. import jobs as jobs_mod
 from .. import llm_runtime
 from .. import sessions as sess_store
 from ..config import config
+
+# Without this the app's own loggers have no handler, so every log.info and
+# log.warning in personal_db is discarded — including the agent's "searching",
+# "tool-turn budget exhausted" and fallback warnings. Voice failures then look
+# like silence in the log while pipecat's own DEBUG output fills it, which is
+# exactly backwards. LOG_LEVEL tunes it without a code change.
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+)
+logging.getLogger("personal_db").setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 from ..retrieve import hybrid_retrieve, vector_retrieve
 from ..stores import configure_llama_index
 from ..ingest import (
