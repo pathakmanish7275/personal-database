@@ -28,10 +28,27 @@ _handler = None
 # subscribed to the same audio. Observed live — two aggregators, every utterance
 # transcribed twice, and two agent turns racing for the NPU.
 _bots: dict[str, asyncio.Task] = {}
+# The WebRTC connection behind each bot. Cancelling the pipeline task does not
+# close it, and a connection left in the "connecting" state runs its own
+# 60-second timer before giving up — which logs "Timeout establishing the
+# connection to the remote peer" long after the caller has already retried and
+# is happily talking on a second call. Observed exactly that: an abandoned
+# attempt warned 15 seconds *after* a successful exchange on its replacement.
+_conns: dict[str, object] = {}
 
 
 async def _retire_existing_bot(session_id: str) -> None:
+    conn = _conns.pop(session_id, None)
     task = _bots.pop(session_id, None)
+
+    if conn is not None:
+        # Closing cancels the connecting-state timeout, so a superseded attempt
+        # dies now and quietly rather than in a minute and loudly.
+        try:
+            await conn.disconnect()
+        except Exception:  # noqa: BLE001 — never block a new call on old cleanup
+            log.debug("could not close the previous connection", exc_info=True)
+
     if task is None or task.done():
         return
     log.info("replacing the running voice bot for session %s", session_id)
@@ -158,10 +175,12 @@ async def voice_offer(request: Request):
             run_voice_bot(connection, stores=stores, session_id=session_id)
         )
         _bots[session_id] = task
+        _conns[session_id] = connection
 
         def _cleanup(t: asyncio.Task) -> None:
             if _bots.get(session_id) is t:
                 _bots.pop(session_id, None)
+                _conns.pop(session_id, None)
 
         task.add_done_callback(_cleanup)
 
