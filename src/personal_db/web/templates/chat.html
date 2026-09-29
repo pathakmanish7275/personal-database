@@ -62,7 +62,17 @@
         </ul>
       </div>
     {% else %}
-      <h2 class="chat-title">{{ current.title }}</h2>
+      <div class="chat-head">
+        <h2 class="chat-title">{{ current.title }}</h2>
+        <div class="mode-toggle" role="tablist" aria-label="Conversation mode">
+          <button type="button" id="modeChatBtn" class="mode-btn is-active" role="tab"
+                  aria-selected="true">Chat</button>
+          <button type="button" id="modeVoiceBtn" class="mode-btn" role="tab"
+                  aria-selected="false" disabled title="Checking voice services…">
+            <span class="mode-dot" aria-hidden="true"></span>Voice
+          </button>
+        </div>
+      </div>
       {% if summary %}
       <details class="memory-panel" id="memoryPanel">
         <summary>Session memory · {{ summary|length }} chars · up to msg #{{ summary_up_to_msg_id }}</summary>
@@ -93,24 +103,48 @@
         {% endfor %}
       </div>
 
-      <form id="askForm" class="ask-form">
-        <div id="voiceStrip" class="voice-strip" hidden>
-          <canvas id="callOrb" class="voice-orb" aria-hidden="true"></canvas>
-          <span class="voice-state" id="callStateText"></span>
-          <span class="voice-heard" id="callHeard"></span>
-          <span class="voice-sources" id="callSources"></span>
-          <button type="button" class="voice-icon" id="muteBtn" title="Mute microphone" aria-label="Mute microphone">
-            <span aria-hidden="true">🎤</span>
-          </button>
-          <button type="button" class="voice-icon danger" id="endBtn" title="End call" aria-label="End call">
-            <span aria-hidden="true">✕</span>
-          </button>
+      <div id="voicePane" class="voice-pane" hidden>
+        <div class="voice-stage">
+          <canvas id="callOrb" class="voice-orb-lg" aria-hidden="true"></canvas>
+          <p class="voice-status" id="callStateText">Connecting…</p>
+          <canvas id="callWave" class="voice-wave" aria-hidden="true"></canvas>
+          <p class="voice-utterance" id="callHeard"></p>
+
+          <div class="voice-controls">
+            <div class="vctl-wrap">
+              <button type="button" class="vctl" id="muteBtn" aria-label="Mute microphone">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Z"/><path d="M18 11v1a6 6 0 0 1-12 0v-1M12 18v3"/></svg>
+              </button>
+              <span class="vctl-label" id="muteLabel">Mute</span>
+            </div>
+            <div class="vctl-wrap">
+              <button type="button" class="vctl vctl-end" id="endBtn" aria-label="End call">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+              </button>
+              <span class="vctl-label">End</span>
+            </div>
+            <div class="vctl-wrap">
+              <button type="button" class="vctl" id="textBtn" aria-label="Hide transcript" aria-expanded="true">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 10h4M7 14h7"/></svg>
+              </button>
+              <span class="vctl-label" id="textLabel">Hide text</span>
+            </div>
+          </div>
         </div>
+
+        <div class="voice-transcript" id="voiceTranscript">
+          <div class="vt-head">
+            <span class="vt-live"><span class="vt-dot" aria-hidden="true"></span>Live transcription</span>
+            <span class="vt-note">Conversation will continue in this chat</span>
+          </div>
+          <div class="vt-body" id="vtBody"></div>
+          <div class="voice-sources" id="callSources"></div>
+        </div>
+      </div>
+
+      <form id="askForm" class="ask-form">
         <textarea id="q" name="q" rows="3" placeholder="Ask anything from your database…  (Enter to send · Shift+Enter for new line)" required></textarea>
         <div class="ask-actions">
-          <button type="button" id="callBtn" class="mic-btn" disabled title="Checking voice services…" aria-label="Start voice call">
-            <span aria-hidden="true">🎙</span><span class="mic-label">Talk</span>
-          </button>
           <button type="submit" class="send-btn">Send</button>
         </div>
       </form>
@@ -295,6 +329,26 @@
             const q = ta.value.trim();
             if (!q) return;
 
+            // On a call, the same box talks to the call. Routing it through the
+            // normal text path instead would run a second, parallel agent turn
+            // against the same session.
+            if (window.__pdbVoice && window.__pdbVoice.onCall()) {
+              ta.value = '';
+              try {
+                const r = await fetch(`/voice/${SID}/say`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ text: q }),
+                });
+                if (!r.ok) throw new Error(await r.text());
+                window.__pdbVoice.refresh();
+              } catch (err) {
+                console.error('[voice] typed message failed', err);
+                ta.value = q;          // give it back rather than lose it
+              }
+              return;
+            }
+
             // Close any previous stream so the connection slot is freed.
             if (window.__pdb.activeES) {
               try { window.__pdb.activeES.close(); } catch (_) {}
@@ -360,23 +414,45 @@
           // agent and is persisted to this same session, so the transcript is
           // polled back into this same thread rather than living in its own UI.
           (function initVoice() {
-            const callBtn   = document.getElementById('callBtn');
-            const strip     = document.getElementById('voiceStrip');
+            const voiceBtn  = document.getElementById('modeVoiceBtn');
+            const chatBtn   = document.getElementById('modeChatBtn');
+            const pane      = document.getElementById('voicePane');
+            const askForm   = document.getElementById('askForm');
             const stateText = document.getElementById('callStateText');
             const heardEl   = document.getElementById('callHeard');
             const orbCanvas = document.getElementById('callOrb');
+            const waveCanvas= document.getElementById('callWave');
             const sourcesEl = document.getElementById('callSources');
             const muteBtn   = document.getElementById('muteBtn');
+            const muteLabel = document.getElementById('muteLabel');
             const endBtn    = document.getElementById('endBtn');
+            const textBtn   = document.getElementById('textBtn');
+            const transcript= document.getElementById('voiceTranscript');
+            const vtBody    = document.getElementById('vtBody');
             const botAudio  = document.getElementById('botAudio');
-            if (!callBtn) return;
+            if (!voiceBtn) return;
 
             let pc = null, micStream = null, pollTimer = null, pingTimer = null;
             let stateES = null, connecting = false, muted = false, orb = null;
-            let known = document.querySelectorAll('#messages .msg').length;
+            // How many messages are already on screen.
+            //
+            // This used to be a counter initialised once here and advanced
+            // only by pollTranscript. But the text-chat path appends its own
+            // bubbles — the optimistic user message and the streamed reply —
+            // without touching it, so after any typed exchange the counter
+            // under-reported what was rendered. The next poll (a voice call
+            // starts one) then asked for `after=<stale>` and re-appended every
+            // message since: the duplicated history.
+            //
+            // Counting the DOM cannot drift, because the DOM is exactly what
+            // we are trying not to duplicate. Overshooting is safe: the server
+            // slices `msgs[after:]` and simply returns nothing.
+            function renderedCount() {
+              return messages.querySelectorAll('.msg').length;
+            }
 
             // Server state -> what the caller is told. A call is mostly waiting;
-            // naming the kind of waiting is the whole point of this bar.
+            // naming the kind of waiting is the whole point of this screen.
             const LABELS = {
               connected:    'Connected',
               listening:    'Listening…',
@@ -388,9 +464,35 @@
               error:        'Something went wrong',
             };
 
-            // A call that silently stops is the worst failure mode here: the bar
-            // keeps claiming progress while nothing is happening. Every failure
-            // path routes through this so the cause is visible on screen.
+            // ── view switching ────────────────────────────────────────────
+            // The view and the call are deliberately independent: you can go
+            // back to Chat mid-call and keep talking, which is what the
+            // transcript panel promises. Only End stops a call.
+            function showVoice(on) {
+              pane.hidden = !on;
+              messages.hidden = !!on;
+              // The composer stays: speech is the lossy channel, and typing is
+              // the only exact-input path for names and spellings STT mangles.
+              // On a call it feeds the call instead of starting a text turn.
+              askForm.hidden = false;
+              askForm.classList.toggle('on-call', !!on);
+              ta.placeholder = on
+                ? 'Type to the voice agent — it will answer out loud…'
+                : 'Ask anything from your database…  (Enter to send · Shift+Enter for new line)';
+              voiceBtn.classList.toggle('is-active', !!on);
+              chatBtn.classList.toggle('is-active', !on);
+              voiceBtn.setAttribute('aria-selected', String(!!on));
+              chatBtn.setAttribute('aria-selected', String(!on));
+              if (!on) messages.scrollTop = messages.scrollHeight;
+            }
+
+            function markOnCall(on) {
+              voiceBtn.classList.toggle('on-call', !!on);
+            }
+
+            // A call that silently stops is the worst failure mode here: the
+            // screen keeps claiming progress while nothing is happening. Every
+            // failure path routes through this so the cause stays visible.
             function fail(where, err) {
               const msg = (err && (err.message || err.name)) || String(err || 'unknown');
               console.error('[voice]', where, err);
@@ -399,11 +501,6 @@
               renderSources([]);
               if (orb) orb.setState('error');
               disconnect({ keepMessage: true });
-            }
-
-            function setBar(show) {
-              strip.hidden = !show;
-              document.querySelector('.ask-form').classList.toggle('is-live', !!show);
             }
 
             function renderState(ev) {
@@ -416,18 +513,57 @@
               // Sources are the clearest case of "show what speech can't say":
               // spoken answers can't carry citations, so name them on screen.
               if (Array.isArray(ev.sources)) renderSources(ev.sources);
-              if (ev.state === 'ended') setBar(false);
+              setPending(ev.state);
+              if (ev.state === 'ended') { markOnCall(false); showVoice(false); }
             }
 
             fetch('/voice/status').then(r => r.json()).then(s => {
-              callBtn.disabled = !s.ready;
-              callBtn.title = s.ready ? 'Talk to your database'
-                                      : ((s.reasons || []).join('; ') || 'Voice unavailable');
-            }).catch(() => { callBtn.title = 'Voice status unavailable'; });
+              voiceBtn.disabled = !s.ready;
+              voiceBtn.title = s.ready ? 'Talk to your database'
+                                       : ((s.reasons || []).join('; ') || 'Voice unavailable');
+            }).catch(() => { voiceBtn.title = 'Voice status unavailable'; });
 
+            // ── transcript ────────────────────────────────────────────────
+            // Turns land in the real chat thread; the panel mirrors them so the
+            // caller can read back what was heard without leaving voice mode.
+            function addTurn(role, text) {
+              const row = document.createElement('div');
+              row.className = 'vt-turn' + (role === 'user' ? ' is-user' : '');
+              const who = document.createElement('span');
+              who.className = 'vt-who';
+              who.textContent = role === 'user' ? 'You' : 'Assistant';
+              const body = document.createElement('div');
+              body.className = 'vt-text';
+              body.textContent = text;
+              row.appendChild(who); row.appendChild(body);
+              vtBody.insertBefore(row, vtBody.querySelector('.vt-pending'));
+              vtBody.scrollTop = vtBody.scrollHeight;
+            }
+
+            function setPending(state) {
+              let el = vtBody.querySelector('.vt-pending');
+              const show = ['listening', 'hearing', 'transcribing', 'thinking', 'searching']
+                .includes(state);
+              if (!show) { if (el) el.remove(); return; }
+              if (!el) {
+                el = document.createElement('div');
+                el.className = 'vt-turn vt-pending';
+                el.innerHTML = '<span class="vt-who"></span><div class="vt-text"></div>';
+                vtBody.appendChild(el);
+              }
+              el.querySelector('.vt-text').textContent = (LABELS[state] || state);
+              vtBody.scrollTop = vtBody.scrollHeight;
+            }
+
+            let polling = false;
             async function pollTranscript() {
+              // Two overlapping polls would both read the same rendered count
+              // before either had appended anything, and render the same turns
+              // twice. The interval tick and the post-send refresh collide easily.
+              if (polling) return;
+              polling = true;
               try {
-                const r = await fetch(`/chat/${SID}/messages?after=${known}`);
+                const r = await fetch(`/chat/${SID}/messages?after=${renderedCount()}`);
                 if (!r.ok) return;
                 const data = await r.json();
                 (data.messages || []).forEach(m => {
@@ -438,19 +574,41 @@
                   content.innerHTML = renderCites(m.content);
                   div.appendChild(content);
                   messages.appendChild(div);
+                  addTurn(m.role, m.content);
                 });
                 if (data.messages && data.messages.length) {
-                  known = data.total;
                   messages.scrollTop = messages.scrollHeight;
                 }
-              } catch (_) {}
+              } catch (_) {
+              } finally {
+                polling = false;
+              }
+            }
+
+            // These filenames share a long common prefix
+            // ("architecture_&_decisions_…"), so truncating from the end — the
+            // CSS default — rendered six identical, useless chips. Drop the
+            // extension and keep the TAIL, which is the part that differs.
+            function shortSource(name) {
+              const base = (name || '').replace(/\.(md|markdown|txt|pdf)$/i, '');
+              return base.length > 30 ? '…' + base.slice(-28) : base;
             }
 
             function renderSources(list) {
               if (!sourcesEl) return;
               if (!list || !list.length) { sourcesEl.textContent = ''; return; }
-              sourcesEl.innerHTML = list.slice(0, 4).map(s =>
-                `<span class="voice-src" title="${escapeHTML(s.path || '')}">${escapeHTML(s.name || '')}</span>`
+              // Several retrieved chunks routinely come from one document; the
+              // chips name documents, so the same one must appear once.
+              const seen = new Set();
+              const uniq = [];
+              for (const s of list) {
+                const key = (s.name || s.path || '').toLowerCase();
+                if (!key || seen.has(key)) continue;
+                seen.add(key);
+                uniq.push(s);
+              }
+              sourcesEl.innerHTML = uniq.slice(0, 6).map(s =>
+                `<span class="voice-src" title="${escapeHTML(s.path || s.name || '')}">${escapeHTML(shortSource(s.name))}</span>`
               ).join('');
             }
 
@@ -461,13 +619,15 @@
               muteBtn.classList.toggle('is-muted', muted);
               muteBtn.title = muted ? 'Unmute microphone' : 'Mute microphone';
               muteBtn.setAttribute('aria-label', muteBtn.title);
+              muteLabel.textContent = muted ? 'Unmute' : 'Mute';
             }
 
             async function connect() {
               if (connecting || pc) return;          // one call at a time
               connecting = true;
-              callBtn.disabled = true;
-              setBar(true);
+              voiceBtn.disabled = true;
+              vtBody.innerHTML = '';
+              showVoice(true);
               stateText.textContent = 'Requesting microphone…';
               heardEl.textContent = '';
               try {
@@ -476,15 +636,16 @@
                 });
               } catch (e) {
                 stateText.textContent = 'Microphone permission denied.';
-                callBtn.disabled = false; connecting = false;
+                voiceBtn.disabled = false; connecting = false;
                 return;
               }
               setMuted(false);
 
-              // Orb reads real levels: the mic while you speak, the reply while
-              // it plays. A fixed animation would look the same whether or not
-              // audio was actually flowing.
+              // Orb and waveform read real levels: the mic while you speak, the
+              // reply while it plays. A fixed animation would look the same
+              // whether or not audio was actually flowing.
               orb = new window.VoiceOrb(orbCanvas);
+              orb.attachWave(waveCanvas);
               orb.addStream(micStream, (s) => s !== 'speaking');
               orb.start();
 
@@ -529,9 +690,8 @@
               };
 
               connecting = false;
-              callBtn.classList.add('on-call');
-              callBtn.setAttribute('aria-label', 'End voice call');
-              callBtn.disabled = false;
+              markOnCall(true);
+              voiceBtn.disabled = false;
 
               stateES = new EventSource(`/voice/${SID}/events`);
               stateES.addEventListener('state', e => {
@@ -549,10 +709,10 @@
               if (orb)       { orb.stop(); orb = null; }
               if (micStream) { micStream.getTracks().forEach(tr => tr.stop()); micStream = null; }
               if (pc) { try { pc.close(); } catch (_) {} pc = null; }
-              callBtn.classList.remove('on-call');
-              callBtn.setAttribute('aria-label', 'Start voice call');
-              callBtn.disabled = false;
-              if (!keepMessage) setBar(false);
+              markOnCall(false);
+              voiceBtn.disabled = false;
+              setPending(null);
+              if (!keepMessage) showVoice(false);
               pollTranscript();   // catch the final turn
             }
 
@@ -560,12 +720,33 @@
               if (connecting || pc) fail('Call failed', ev.reason);
             });
 
-            callBtn.addEventListener('click', () => {
-              if (pc) { disconnect(); return; }
+            // The submit handler above runs in this same closure's parent, so
+            // the call state is published rather than reached for directly.
+            window.__pdbVoice = {
+              onCall: () => !!pc,
+              // Deliberately not an optimistic echo: the turn is persisted
+              // server-side and polled back like a spoken one, so painting it
+              // here too rendered every typed message twice. Just poll sooner.
+              refresh: () => { pollTranscript(); },
+            };
+
+            voiceBtn.addEventListener('click', () => {
+              // Already talking? This is just a view switch back to the call.
+              if (pc) { showVoice(true); return; }
               connect().catch(err => fail('Could not start the call', err));
             });
-            endBtn.addEventListener('click', disconnect);
+            chatBtn.addEventListener('click', () => showVoice(false));
+            endBtn.addEventListener('click', () => disconnect());
             muteBtn.addEventListener('click', () => setMuted(!muted));
+            const textLabel = document.getElementById('textLabel');
+            textBtn.addEventListener('click', () => {
+              const open = transcript.hidden;        // about to become visible?
+              transcript.hidden = !open;
+              textBtn.classList.toggle('is-off', !open);
+              textBtn.setAttribute('aria-expanded', String(open));
+              textBtn.setAttribute('aria-label', open ? 'Hide transcript' : 'Show transcript');
+              textLabel.textContent = open ? 'Hide text' : 'Show text';
+            });
             window.addEventListener('beforeunload', () => { if (pc) disconnect(); });
           })();
 

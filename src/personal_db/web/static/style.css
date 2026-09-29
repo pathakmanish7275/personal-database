@@ -345,6 +345,32 @@ legend { padding: 0 0.4rem; color: var(--muted); font-size: 0.82rem; letter-spac
   border-color: var(--border-hi);
   border-top-right-radius: 2px;
 }
+/* The role label straddles the top border, so it must be absolutely
+   positioned — which means it contributes nothing to the bubble's width.
+   The bubble is `width: fit-content`, so a short reply ("Yes.") collapsed to
+   min-width and the word ASSISTANT ran out past its right edge.
+
+   This invisible twin sits in normal flow and carries the same text in the
+   same typography, so the bubble's max-content width can never be narrower
+   than the label. Measuring the label in CSS is not possible; reserving space
+   with a hardcoded min-width would be a guess that breaks whenever the label
+   text, font or letter-spacing changes. This stays correct by construction. */
+.msg::before {
+  display: block;
+  height: 0;
+  overflow: hidden;
+  visibility: hidden;          /* reserves width, paints nothing */
+  padding: 0 0.45rem;          /* matches the real label's padding */
+  font-family: var(--font-sans);
+  font-size: 0.62rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  white-space: nowrap;
+}
+.msg-user::before { content: 'you'; }
+.msg-assistant::before { content: 'assistant'; }
+
 .msg::after {
   position: absolute;
   top: -0.62rem;
@@ -356,6 +382,7 @@ legend { padding: 0 0.4rem; color: var(--muted); font-size: 0.82rem; letter-spac
   text-transform: uppercase;
   letter-spacing: 0.14em;
   color: var(--muted-2);
+  white-space: nowrap;
 }
 .msg-user::after { content: 'you'; right: 0.8rem; color: var(--accent); }
 .msg-assistant::after { content: 'assistant'; left: 0.8rem; color: var(--link); }
@@ -1027,32 +1054,205 @@ table.library tr:hover td { background: var(--surface-2); }
    invents a second visual language. */
 
 .ask-form { position: relative; }
-.ask-form.is-live .voice-strip { border-color: var(--border-hi); }
 
-.voice-strip {
+/* ── conversation header: title left, mode toggle right ──────────────────── */
+.chat-head {
   display: flex;
-  align-items: center;
-  gap: 0.55rem;
-  padding: 0.4rem 0.55rem;
-  margin-bottom: 0.45rem;
-  border: 1px solid var(--border);
-  border-radius: 4px;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  flex: 0 0 auto;
+}
+.chat-head .chat-title { margin-bottom: 0; }
+
+/* A segmented control, not two buttons: the two modes are one choice, and the
+   moving pill is what says so. */
+.mode-toggle {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
   background: var(--surface);
-  font-size: 0.85rem;
-  min-height: 42px;
-  transition: border-color var(--t-med);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  flex: none;
 }
-.voice-orb { width: 26px; height: 26px; flex: none; display: block; }
-.voice-state { font-weight: 600; letter-spacing: 0.01em; white-space: nowrap; }
-.voice-heard {
-  flex: 1 1 auto; min-width: 0;
+.mode-btn {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  padding: 0.3rem 0.85rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
   color: var(--muted);
-  font-family: var(--font-serif);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color var(--t-fast), background var(--t-fast), border-color var(--t-fast);
 }
+.mode-btn:hover:not(:disabled) { color: var(--fg); background: var(--surface-2); }
+.mode-btn.is-active {
+  color: var(--fg-strong);
+  background: var(--surface-3);
+  border-color: var(--border-hi);
+}
+.mode-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* A call can outlive the voice view — you may switch back to Chat and keep
+   talking — so the toggle carries the only signal that one is still running. */
+.mode-dot { width: 6px; height: 6px; border-radius: 50%; background: transparent; }
+.mode-btn.on-call .mode-dot { background: var(--ok); animation: modePulse 1.6s ease-in-out infinite; }
+@keyframes modePulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+/* ── voice mode: takes the conversation area, not a strip above the box ──── */
+.voice-pane {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+  padding: 0.4rem 0 0.75rem;
+  /* NOT overflow-y:auto. Scrolling here lets every child size to its own
+     content, so the transcript's `flex: 1 1 auto` claims nothing and collapses
+     to a few unreadable lines. The transcript does its own scrolling instead. */
+  overflow: hidden;
+}
+/* Must never shrink below its own content. With `flex: 0 1 auto` plus
+   `min-height: 0` the box shrank while its children (all `flex: none`) kept
+   their size, so the Mute/End/Show-text row spilled out of the stage and the
+   transcript, being the next sibling, painted straight over it. The
+   max-height media query below is what buys space on short windows — by
+   making the contents smaller, not by clipping them. */
+.voice-stage {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 0.9rem 1rem 0.35rem;
+}
+.voice-orb-lg {
+  width: clamp(96px, 18vh, 168px);
+  height: clamp(96px, 18vh, 168px);
+  display: block;
+  flex: none;
+}
+.voice-status {
+  margin: 0.5rem 0 0;
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--fg-strong);
+}
+.voice-wave { width: min(420px, 78%); height: 34px; display: block; margin: 0.4rem 0 0.15rem; flex: none; }
+.voice-utterance {
+  margin: 0.1rem 0 0;
+  max-width: 46ch;
+  min-height: 1.5em;
+  max-height: 3em;
+  overflow: hidden;
+  font-family: var(--font-serif);
+  font-size: 0.98rem;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+/* ── call controls ───────────────────────────────────────────────────────── */
+.voice-controls {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 2.1rem;
+  margin-top: 0.75rem;
+  flex: none;
+}
+.vctl-wrap { display: flex; flex-direction: column; align-items: center; gap: 0.45rem; }
+.vctl {
+  width: 52px; height: 52px;
+  padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--surface-2);
+  border: 1px solid var(--border-hi);
+  border-radius: 50%;
+  color: var(--fg);
+  cursor: pointer;
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
+}
+.vctl:hover { background: var(--surface-3); color: var(--fg-strong); }
+.vctl svg {
+  width: 21px; height: 21px;
+  fill: none; stroke: currentColor;
+  stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round;
+}
+.vctl.is-muted { border-color: var(--accent); color: var(--accent); background: rgba(210,168,107,0.10); }
+.vctl.is-off   { border-color: var(--border); color: var(--muted-2); }
+
+/* End is the one destructive control, so it is the one filled shape. */
+.vctl-end {
+  width: 62px; height: 62px;
+  background: var(--err);
+  border-color: var(--err);
+  color: #1b1310;
+}
+.vctl-end:hover { background: #e58c8c; border-color: #e58c8c; color: #1b1310; }
+.vctl-end svg { width: 25px; height: 25px; stroke-width: 2.2; }
+.vctl-label {
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-family: var(--font-mono);
+}
+
+/* ── live transcription ──────────────────────────────────────────────────── */
+.voice-transcript {
+  flex: 1 1 auto;
+  /* A floor so the panel stays readable, but low enough that it can yield
+     instead of colliding with the controls above it. */
+  min-height: 120px;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.vt-head {
+  flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: space-between; gap: 0.75rem;
+  padding: 0.55rem 0.8rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
+}
+.vt-live { display: inline-flex; align-items: center; gap: 0.45rem; font-size: 0.82rem; font-weight: 600; }
+.vt-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); animation: modePulse 1.6s ease-in-out infinite; }
+.vt-note { font-size: 0.72rem; color: var(--muted-2); }
+.vt-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 0.6rem 0.8rem; }
+.vt-turn { display: flex; gap: 0.6rem; padding: 0.4rem 0; }
+/* min-width rather than a fixed width: the column still lines up, but a
+   label that outgrows it pushes the text across instead of overflowing its
+   own box and printing on top of the transcript. Same failure the message
+   bubbles had — ASSISTANT is simply a long word at this size. */
+.vt-who {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted-2);
+  min-width: 4.6rem;
+  white-space: nowrap;
+  padding-top: 0.2rem;
+}
+.vt-turn.is-user .vt-who { color: var(--accent); }
+.vt-text { font-family: var(--font-serif); font-size: 0.92rem; line-height: 1.5; color: var(--fg); }
+.vt-pending .vt-text { color: var(--muted-2); font-style: italic; }
+.vt-body::-webkit-scrollbar { width: 9px; }
+.vt-body::-webkit-scrollbar-track { background: transparent; }
+.vt-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 
 /* Sources reuse the citation chip exactly — same idea, same object. */
-.voice-sources { display: flex; gap: 0.3rem; flex: none; max-width: 38%; overflow: hidden; }
+.voice-sources { display: flex; flex-wrap: wrap; gap: 0.3rem; padding: 0 0.8rem 0.6rem; }
+.voice-sources:empty { display: none; }
 .voice-src {
   display: inline-flex; align-items: center;
   background: var(--surface-2);
@@ -1063,31 +1263,37 @@ table.library tr:hover td { background: var(--surface-2); }
   border-radius: 3px;
   border: 1px solid transparent;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  max-width: 132px;
+  max-width: 240px;
 }
 
-/* Square siblings of the main buttons, sized to the strip. */
-.voice-icon {
-  flex: none;
-  width: 28px; height: 28px;
-  padding: 0;
-  display: inline-flex; align-items: center; justify-content: center;
-  font-size: 0.78rem; line-height: 1;
-}
-.voice-icon.is-muted {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-.voice-icon.danger:hover { border-color: var(--err); color: var(--err); }
-
-/* The mic is a normal button that happens to carry an icon — it sits beside
-   Send and must read as its peer, not as a different kind of control. */
 .ask-actions { display: flex; gap: 0.5rem; align-items: center; justify-content: flex-end; }
-.mic-btn { display: inline-flex; align-items: center; gap: 0.4rem; }
-.mic-btn.on-call { border-color: var(--err); color: var(--err); }
-.mic-btn.on-call:hover { border-color: var(--err); color: var(--fg-strong); }
+
+/* A short window is the case where the stage must yield most: the orb is
+   decoration, the transcript is information. */
+@media (max-height: 760px) {
+  .voice-stage { padding-top: 0.4rem; }
+  .voice-wave { height: 26px; }
+  .vctl { width: 44px; height: 44px; }
+  .vctl-end { width: 52px; height: 52px; }
+}
 
 @media (max-width: 720px) {
-  .voice-sources { display: none; }
-  .mic-label { display: none; }
+  .voice-controls { gap: 1.4rem; }
+  .vt-note { display: none; }
+  .chat-head { flex-wrap: wrap; gap: 0.5rem; }
+}
+
+/* The composer during a call: same box, different destination. Marked so it
+   cannot be mistaken for starting a separate text turn while talking. */
+.ask-form.on-call {
+  border-top-color: var(--border-hi);
+}
+.ask-form.on-call textarea {
+  border-color: var(--ok);
+  background: var(--bg-elev);
+}
+.ask-form.on-call .send-btn::after {
+  content: ' to call';
+  font-weight: 500;
+  opacity: 0.75;
 }
