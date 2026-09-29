@@ -434,6 +434,7 @@
 
             let pc = null, micStream = null, pollTimer = null, pingTimer = null;
             let stateES = null, connecting = false, muted = false, orb = null;
+            let stallTimer = null;
             // How many messages are already on screen.
             //
             // This used to be a counter initialised once here and advanced
@@ -686,8 +687,23 @@
               }
               await pc.setRemoteDescription(answer);
               pc.onconnectionstatechange = () => {
+                if (pc.connectionState === 'connected' && stallTimer) {
+                  clearTimeout(stallTimer); stallTimer = null;
+                }
                 if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) disconnect();
               };
+
+              // If ICE never completes, the server gives up after 60s and the
+              // screen would sit on "Connecting…" the whole time, looking
+              // identical to a call that is simply slow to start. Say so early
+              // enough to be worth acting on.
+              if (stallTimer) clearTimeout(stallTimer);
+              stallTimer = setTimeout(() => {
+                if (pc && pc.connectionState !== 'connected') {
+                  stateText.textContent =
+                    'Still connecting — the audio link has not come up. End and try again.';
+                }
+              }, 12000);
 
               connecting = false;
               markOnCall(true);
@@ -703,6 +719,7 @@
             function disconnect(opts) {
               const keepMessage = !!(opts && opts.keepMessage);
               connecting = false;
+              if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
               if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
               if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
               if (stateES)   { try { stateES.close(); } catch (_) {} stateES = null; }
