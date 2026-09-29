@@ -71,10 +71,39 @@ if ! curl -sf "${OLLAMA_URL}/api/tags" >/dev/null 2>&1; then
   fi
 fi
 
-# Verify required models are present; pull if missing.
-# Chat LLM runs on FLM (below); local Ollama only needs the fallback chat
-# model and the embedding model.
-need_models=("${FALLBACK_LLM_MODEL:-qwen3.5:4b}" "nomic-embed-text")
+# ── which backend serves chat: NPU (FLM) or Ollama ───────────────────────────
+# `flm` only installs on machines with a supported NPU, so its presence is the
+# device test. Getting this wrong is expensive in both directions: without the
+# check a CPU/GPU box spends 60s polling a port nothing will ever bind and then
+# prints a memlock warning that has nothing to do with its problem, and Ollama
+# is never told to fetch the chat model because we assumed FLM had it.
+FLM_PORT="${FLM_PORT:-52625}"
+FLM_URL="http://localhost:${FLM_PORT}"
+CHAT_MODEL="${LLM_MODEL:-qwen3.5:4b}"
+
+if command -v flm >/dev/null 2>&1; then
+  CHAT_BACKEND="flm"
+else
+  CHAT_BACKEND="ollama"
+  # A leftover LLM_HOST pointing at FLM on a machine without it would send
+  # every turn down the fallback path, quietly and slowly. Say so once.
+  case "${LLM_HOST:-}" in
+    *:${FLM_PORT}*)
+      echo "NOTE: LLM_HOST points at FLM (:${FLM_PORT}) but flm is not installed here."
+      echo "      Comment out LLM_HOST in .env so chat uses Ollama directly."
+      ;;
+  esac
+fi
+
+# Verify required models are present; pull if missing. Ollama always serves
+# embeddings; it serves chat too unless FLM is doing it.
+need_models=("nomic-embed-text" "${FALLBACK_LLM_MODEL:-qwen3.5:4b}")
+if [ "$CHAT_BACKEND" = "ollama" ]; then
+  need_models+=("$CHAT_MODEL")
+fi
+# De-dupe: the chat model and the fallback are the same by default, and
+# `have_models` is read once up front, so a repeated name pulls twice.
+readarray -t need_models < <(printf '%s\n' "${need_models[@]}" | awk '!seen[$0]++')
 have_models="$(ollama list 2>/dev/null | awk 'NR>1 {print $1}')"
 for m in "${need_models[@]}"; do
   if ! grep -qx "$m" <<<"$have_models" && ! grep -q "^${m}:" <<<"$have_models"; then
@@ -83,37 +112,40 @@ for m in "${need_models[@]}"; do
   fi
 done
 
-# Start the FLM (NPU) chat-LLM server if it isn't already running.
-# Runs as the current user — no sudo — provided:
-#   - the model files live under ~/.config/flm (not /root/.config/flm), and
-#   - memlock is unlimited. NB: PAM's /etc/security/limits.d does NOT apply
-#     here — GNOME starts terminals from the user systemd manager, so the
-#     limit comes from /etc/systemd/system/user@.service.d/memlock.conf
-#     (LimitMEMLOCK=infinity) and needs a reboot to take effect.
-FLM_PORT="${FLM_PORT:-52625}"
-# FLM serves the app's chat model, so default to LLM_MODEL from .env (sourced
-# above). Override with FLM_MODEL=... to serve something else.
-FLM_MODEL="${FLM_MODEL:-${LLM_MODEL:-qwen3.5:4b}}"
-# NPU guardrails: -q 1 caps FLM's own queue at one request (our serialization
-# gate does the queueing — see FLM-NPU-INTEGRATION.md §4), -s 4 limits sockets.
-FLM_SERVE_ARGS="${FLM_SERVE_ARGS:--q 1 -s 4}"
-FLM_URL="http://localhost:${FLM_PORT}"
-if ! curl -sf "${FLM_URL}/api/tags" >/dev/null 2>&1; then
-  echo "Starting FLM server (${FLM_MODEL}) on port ${FLM_PORT}..."
-  # FLM takes the port as --port; it does not read FLM_PORT from the env.
-  # shellcheck disable=SC2086
-  nohup flm serve "${FLM_MODEL}" --port "${FLM_PORT}" $FLM_SERVE_ARGS \
-    >./data/flm.log 2>&1 &
-  for i in $(seq 1 60); do
-    if curl -sf "${FLM_URL}/api/tags" >/dev/null 2>&1; then break; fi
-    sleep 1
-  done
+if [ "$CHAT_BACKEND" = "flm" ]; then
+  # Start the FLM (NPU) chat-LLM server if it isn't already running.
+  # Runs as the current user — no sudo — provided:
+  #   - the model files live under ~/.config/flm (not /root/.config/flm), and
+  #   - memlock is unlimited. NB: PAM's /etc/security/limits.d does NOT apply
+  #     here — GNOME starts terminals from the user systemd manager, so the
+  #     limit comes from /etc/systemd/system/user@.service.d/memlock.conf
+  #     (LimitMEMLOCK=infinity) and needs a reboot to take effect.
+  #
+  # FLM serves the app's chat model, so default to LLM_MODEL from .env (sourced
+  # above). Override with FLM_MODEL=... to serve something else.
+  FLM_MODEL="${FLM_MODEL:-$CHAT_MODEL}"
+  # NPU guardrails: -q 1 caps FLM's own queue at one request (our serialization
+  # gate does the queueing — see FLM-NPU-INTEGRATION.md §4), -s 4 limits sockets.
+  FLM_SERVE_ARGS="${FLM_SERVE_ARGS:--q 1 -s 4}"
   if ! curl -sf "${FLM_URL}/api/tags" >/dev/null 2>&1; then
-    echo "WARNING: FLM did not come up; see ./data/flm.log"
-    echo "         Likely memlock too low (check: ulimit -l) or model not in"
-    echo "         ~/.config/flm. Chat will fall back to local Ollama"
-    echo "         (${FALLBACK_LLM_MODEL:-qwen3.5:4b}) meanwhile."
+    echo "Starting FLM server (${FLM_MODEL}) on port ${FLM_PORT}..."
+    # FLM takes the port as --port; it does not read FLM_PORT from the env.
+    # shellcheck disable=SC2086
+    nohup flm serve "${FLM_MODEL}" --port "${FLM_PORT}" $FLM_SERVE_ARGS \
+      >./data/flm.log 2>&1 &
+    for i in $(seq 1 60); do
+      if curl -sf "${FLM_URL}/api/tags" >/dev/null 2>&1; then break; fi
+      sleep 1
+    done
+    if ! curl -sf "${FLM_URL}/api/tags" >/dev/null 2>&1; then
+      echo "WARNING: FLM did not come up; see ./data/flm.log"
+      echo "         Likely memlock too low (check: ulimit -l) or model not in"
+      echo "         ~/.config/flm. Chat will fall back to local Ollama"
+      echo "         (${FALLBACK_LLM_MODEL:-qwen3.5:4b}) meanwhile."
+    fi
   fi
+else
+  echo "No NPU runtime (flm) found — chat runs on Ollama (${CHAT_MODEL})."
 fi
 
 # Where the local voice-agent project lives (supplies the STT/TTS servers).
