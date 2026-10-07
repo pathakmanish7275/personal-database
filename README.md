@@ -4,6 +4,12 @@ A fully-local, privacy-first AI assistant that answers questions from **your own
 
 Everything runs on your machine. Your data never leaves.
 
+> **One optional exception, outside the app.** The maintenance tool in
+> [`tools/kg-deepseek/`](tools/kg-deepseek/) can re-extract the knowledge graph
+> with a *hosted* model (OpenRouter) when you want higher-accuracy extraction.
+> It is entirely opt-in, nothing in the app ever calls it, and the app itself
+> makes no network calls beyond your local model servers.
+
 ---
 
 ## What it does
@@ -305,12 +311,6 @@ src/personal_db/
 - [ ] LLM-enhanced KG extraction for flagged documents (journals, decision logs)
 - [ ] Graph community detection (HDBSCAN over chunk embeddings)
 - [ ] Export/import corpus snapshots
-
----
-
-## License
-
-MIT — see [LICENSE](LICENSE).
 
 ---
 
