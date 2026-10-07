@@ -308,12 +308,6 @@ src/personal_db/
 
 ---
 
-## License
-
-MIT — see [LICENSE](LICENSE).
-
----
-
 ## Acknowledgements
 
 NPU inference is powered by **[FastFlowLM](https://github.com/ROCm/FastFlowLM)** (MIT).
